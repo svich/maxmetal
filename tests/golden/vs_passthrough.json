@@ -1,0 +1,1 @@
+"bindings": [{"msl_name": "vp_c3", "msl_type": "constant maxmetal_cb*", "arg_id": 0, "kind": "cbuf", "reg": 0}], "vertex_inputs": [{"location": 0, "msl_type": "float4"}, {"location": 1, "msl_type": "float4"}], "drv_reads": {}, "drv_unfillable": [], "deps": {"tex": {}, "img": {}, "attr": {}, "fout": {}}, "compare_slots": []
