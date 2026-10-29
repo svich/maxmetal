@@ -1,11 +1,17 @@
 cmake_minimum_required(VERSION 3.16)
 project(maxmetal VERSION 0.1.0 LANGUAGES C)
 
-option(MAXMETAL_BUILD_CLI "Build the maxmetal command-line tool" ON)
-option(MAXMETAL_BUILD_DIFF "Build maxmetal-diff, the GPU differential check (macOS, Metal)" ${APPLE})
-if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+# the library alone by default as a subproject (add_subdirectory) and on iOS and the other non-macOS Apple platforms
+set(top OFF)
+if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR AND NOT (APPLE AND NOT CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
   set(top ON)
 endif()
+set(mac OFF)
+if(top AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+  set(mac ON)
+endif()
+option(MAXMETAL_BUILD_CLI "Build the maxmetal command-line tool" ${top})
+option(MAXMETAL_BUILD_DIFF "Build maxmetal-diff, the GPU differential check (macOS, Metal)" ${mac})
 option(MAXMETAL_BUILD_TESTS "Build the tests (ctest)" ${top})
 
 include(GNUInstallDirs)

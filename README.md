@@ -55,7 +55,9 @@ cmake --install build --prefix /usr/local   # optional
 
 Produces `build/libmaxmetal.a` (`-DBUILD_SHARED_LIBS=ON` for a shared library), `build/maxmetal`, and on macOS
 `build/maxmetal-diff`. Other CMake projects can use `add_subdirectory(maxmetal)` or, after install,
-`find_package(maxmetal)`, then link `maxmetal::maxmetal`.
+`find_package(maxmetal)`, then link `maxmetal::maxmetal`. As a subproject, and for iOS (`-DCMAKE_SYSTEM_NAME=iOS`),
+only the library is built by default: `MAXMETAL_BUILD_CLI`, `MAXMETAL_BUILD_DIFF` and `MAXMETAL_BUILD_TESTS` turn
+the rest on.
 
 ## Library
 
