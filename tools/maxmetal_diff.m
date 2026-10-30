@@ -38,7 +38,14 @@ static void wait_cb(id<MTLCommandBuffer> cb, const char *who) {
 static uint64_t g_rng;
 static uint32_t rnd(void) { g_rng ^= g_rng << 13; g_rng ^= g_rng >> 7; g_rng ^= g_rng << 17; return (uint32_t)(g_rng >> 16); }
 static float rndf(void) { return (rnd() & 0xFFFFFF) / 16777216.0f; }
-static void seed(const char *s) { g_rng = 1469598103934665603ull; for (; *s; s++) g_rng = (g_rng ^ (uint8_t)*s) * 1099511628211ull; if (!g_rng) g_rng = 1; }
+// MAXMETAL_DIFF_SEED=<text>: other random inputs (mixed into the variant's seed)
+static void seed(const char *s) {
+    const char *salt = getenv("MAXMETAL_DIFF_SEED");
+    g_rng = 1469598103934665603ull;
+    for (; *s; s++) g_rng = (g_rng ^ (uint8_t)*s) * 1099511628211ull;
+    for (; salt && *salt; salt++) g_rng = (g_rng ^ (uint8_t)*salt) * 1099511628211ull;
+    if (!g_rng) g_rng = 1;
+}
 
 typedef struct { NSString *msl; NSDictionary *refl; id<MTLFunction> fn; NSString *err; const char *who; } Side;
 
@@ -144,10 +151,18 @@ static NSString *g_stage;
 
 static id<MTLBuffer> buf_with(NSData *d) { return [dev newBufferWithBytes:d.bytes length:d.length options:MTLResourceStorageModeShared]; }
 
+// g_ints != 0: constant and storage buffer words integers in [0, g_ints) instead of floats (loop counts and indices
+// read from them small: loops that never end on float bits end). MAXMETAL_DIFF_INTS=N for every variant; otherwise
+// only a looping one's second run (main)
+static uint32_t g_ints;
+
 static NSData *random_floats(size_t bytes) {
     NSMutableData *d = [NSMutableData dataWithLength:bytes];
     float *f = d.mutableBytes;
-    for (size_t i = 0; i < bytes / 4; i++) f[i] = rndf();
+    for (size_t i = 0; i < bytes / 4; i++) {
+        if (g_ints) ((uint32_t *)f)[i] = rnd() % g_ints;
+        else f[i] = rndf();
+    }
     return d;
 }
 
@@ -687,7 +702,6 @@ int main(int argc, const char **argv) {
                 NSString *variant = @(argv[i]);
                 Side R = {.who = "ryujinx"}, L = {.who = "maxmetal"};
                 g_variant = argv[i];
-                g_capped = 0;
                 if (!load_side(&R, ryu, variant)) { printf("skip %s ryujinx: %s\n", argv[i], [[R.err stringByReplacingOccurrencesOfString:@"\n" withString:@" "] substringToIndex:MIN(R.err.length, 160u)].UTF8String); continue; }
                 int loops_r = g_capsites;
                 if (!load_side(&L, mm, variant)) { printf("fail %s maxmetal compile: %s\n", argv[i], [[L.err stringByReplacingOccurrencesOfString:@"\n" withString:@" "] substringToIndex:MIN(L.err.length, 200u)].UTF8String); continue; }
@@ -699,109 +713,121 @@ int main(int argc, const char **argv) {
                 // the stage the program is (the SPH's; a real game's "ps" request can be a vertex program), not the request's label
                 NSString *kind = R.refl[@"msl_entry_kind"];
                 g_stage = [kind isEqual:@"vertex"] ? @"vs" : [kind isEqual:@"fragment"] ? @"ps" : [kind isEqual:@"kernel"] ? @"cs" : R.refl[@"stage"];
-                g_res = [NSMutableDictionary dictionary]; g_init = [NSMutableDictionary dictionary];
-                seed(argv[i]);
-                NSMutableDictionary *wr = [NSMutableDictionary dictionary], *wl = [NSMutableDictionary dictionary];
-                Cmp c = {0};
-                NSString *er = nil, *el = nil;
-                double tr = 0, tl = 0;
                 NSMutableDictionary *types = [NSMutableDictionary dictionary];  // (vs: the Ryujinx path's vertex input types)
-                if ([g_stage isEqual:@"ps"]) {
+                NSString *el0 = nil;
+                if ([g_stage isEqual:@"ps"])
                     // outputs the Ryujinx path declares as integers: the maxmetal function retyped as the renderer retypes it
                     for (int n = 0; n < 8; n++) {
                         BOOL pr, pl; MTLPixelFormat fr = out_format(R.msl, n, &pr); out_format(L.msl, n, &pl);
                         if (pr && pl && fr != MTLPixelFormatRGBA32Float) {
                             L.msl = retype_color(L.msl, n, fr == MTLPixelFormatRGBA32Uint ? @"uint" : @"int");
                             NSString *e2 = nil; L.fn = compile(L.msl, &e2);
-                            if (!L.fn) { el = [NSString stringWithFormat:@"retyped: %@", e2]; break; }
+                            if (!L.fn) { el0 = [NSString stringWithFormat:@"retyped: %@", e2]; break; }
                         }
                     }
-                    NSData *cr = nil, *cl = nil;
-                    if (!el) er = run_fragment(&R, &cr, wr, NULL);
-                    if (!er && !el) el = run_fragment(&L, &cl, wl, NULL);
-                    if (!er && !el) {
-                        const char *dump = getenv("MAXMETAL_DIFF_DUMP");   // <dir>: both sides' outputs as <variant>.ryu / .maxmetal
-                        if (dump) {
-                            [cr writeToFile:[NSString stringWithFormat:@"%s/%s.ryu", dump, argv[i]] atomically:NO];
-                            [cl writeToFile:[NSString stringWithFormat:@"%s/%s.maxmetal", dump, argv[i]] atomically:NO];
-                        }
-                        const uint8_t *pr = cr.bytes, *pl = cl.bytes;
-                        for (int n = 0; n < 9; n++) {
-                            uint32_t lr, ll; memcpy(&lr, pr, 4); memcpy(&ll, pl, 4); pr += 4; pl += 4;
-                            if (lr != ll) { c.diff++; c.first = c.first ?: [NSString stringWithFormat:@"output %d present in one only", n]; }
-                            else if (lr) {
-                                BOOL fl; MTLPixelFormat f = n < 8 ? out_format(R.msl, n, &fl) : MTLPixelFormatRGBA32Float;
-                                cmp_words(&c, (const uint32_t *)pr, (const uint32_t *)pl, lr / 4, f == MTLPixelFormatRGBA32Float, n < 8 ? [NSString stringWithFormat:@"color%d", n] : @"depth");
-                            }
-                            pr += lr; pl += ll;
-                        }
-                    }
-                } else if ([g_stage isEqual:@"vs"]) {
+                else if ([g_stage isEqual:@"vs"])
                     for (NSDictionary *vi in R.refl[@"vertex_inputs"]) types[vi[@"location"]] = vi[@"msl_type"];
-                    NSData *dr = nil, *dl = nil;
-                    er = run_vertex(&R, &dr, wr, types, NULL);
-                    if (!er) el = run_vertex(&L, &dl, wl, types, NULL);
-                    if (!er && !el) {
-                        const char *dump = getenv("MAXMETAL_DIFF_DUMP");   // <dir>: both sides' varyings (64 vertices x 34 x float4)
-                        if (dump) {
-                            [dr writeToFile:[NSString stringWithFormat:@"%s/%s.ryu", dump, argv[i]] atomically:NO];
-                            [dl writeToFile:[NSString stringWithFormat:@"%s/%s.maxmetal", dump, argv[i]] atomically:NO];
-                        }
-                        // varyings maxmetal writes; the Ryujinx path's (0, 0, 0, 1) for one it does not write is not compared
-                        const uint32_t *a2 = dr.bytes, *b2 = dl.bytes;
-                        for (int v = 0; v < 64; v++)
-                            for (int s = 0; s < 34; s++) {
-                                const uint32_t *x = a2 + (v * 34 + s) * 4, *y = b2 + (v * 34 + s) * 4;
-                                BOOL zx = !x[0] && !x[1] && !x[2] && !x[3], zy = !y[0] && !y[1] && !y[2] && !y[3];
-                                if (zx != zy && s < 32) { c.diff++; c.first = c.first ?: [NSString stringWithFormat:@"varying %d written by one only", s]; continue; }
-                                cmp_words(&c, x, y, s == 33 ? 1 : 4, YES, s == 32 ? @"position" : s == 33 ? @"point size" : [NSString stringWithFormat:@"v%d", s]);
+                // a run that hits the loop cap and differs runs again on integer inputs (its loops then end: all five
+                // capped of a game's 31307 variants matched, 2026-10-30), unless MAXMETAL_DIFF_INTS already chose them
+                g_ints = getenv("MAXMETAL_DIFF_INTS") ? (uint32_t)atoi(getenv("MAXMETAL_DIFF_INTS")) : 0;
+                for (BOOL rerun = NO;; rerun = YES) {
+                    g_capped = 0;
+                    g_res = [NSMutableDictionary dictionary]; g_init = [NSMutableDictionary dictionary];
+                    seed(argv[i]);
+                    NSMutableDictionary *wr = [NSMutableDictionary dictionary], *wl = [NSMutableDictionary dictionary];
+                    Cmp c = {0};
+                    NSString *er = nil, *el = el0;
+                    double tr = 0, tl = 0;
+                    if ([g_stage isEqual:@"ps"]) {
+                        NSData *cr = nil, *cl = nil;
+                        if (!el) er = run_fragment(&R, &cr, wr, NULL);
+                        if (!er && !el) el = run_fragment(&L, &cl, wl, NULL);
+                        if (!er && !el) {
+                            const char *dump = getenv("MAXMETAL_DIFF_DUMP");   // <dir>: both sides' outputs as <variant>.ryu / .maxmetal
+                            if (dump) {
+                                [cr writeToFile:[NSString stringWithFormat:@"%s/%s.ryu", dump, argv[i]] atomically:NO];
+                                [cl writeToFile:[NSString stringWithFormat:@"%s/%s.maxmetal", dump, argv[i]] atomically:NO];
                             }
-                    }
-                } else {
-                    er = run_compute(&R, wr, NULL);
-                    if (!er) el = run_compute(&L, wl, NULL);
-                }
-                // stores to storage buffers (both started from the same contents)
-                if (!er && !el)
-                    for (NSString *k in wr) {
-                        if (!wl[k]) { c.diff++; c.first = c.first ?: [NSString stringWithFormat:@"%@ bound by ryujinx only", k]; continue; }
-                        if ([k hasPrefix:@"img:"]) {   // an image: its texels (uint formats bit for bit)
-                            NSString *fmt = [k componentsSeparatedByString:@":"].lastObject;
-                            NSData *x = image_bytes(wr[k], fmt), *y = image_bytes(wl[k], fmt);
-                            cmp_words(&c, x.bytes, y.bytes, x.length / 4, [fmt isEqual:@""], k);
-                            continue;
+                            const uint8_t *pr = cr.bytes, *pl = cl.bytes;
+                            for (int n = 0; n < 9; n++) {
+                                uint32_t lr, ll; memcpy(&lr, pr, 4); memcpy(&ll, pl, 4); pr += 4; pl += 4;
+                                if (lr != ll) { c.diff++; c.first = c.first ?: [NSString stringWithFormat:@"output %d present in one only", n]; }
+                                else if (lr) {
+                                    BOOL fl; MTLPixelFormat f = n < 8 ? out_format(R.msl, n, &fl) : MTLPixelFormatRGBA32Float;
+                                    cmp_words(&c, (const uint32_t *)pr, (const uint32_t *)pl, lr / 4, f == MTLPixelFormatRGBA32Float, n < 8 ? [NSString stringWithFormat:@"color%d", n] : @"depth");
+                                }
+                                pr += lr; pl += ll;
+                            }
                         }
-                        id<MTLBuffer> x = wr[k], y = wl[k];
-                        cmp_words(&c, x.contents, y.contents, x.length / 4, YES, k);
+                    } else if ([g_stage isEqual:@"vs"]) {
+                        NSData *dr = nil, *dl = nil;
+                        er = run_vertex(&R, &dr, wr, types, NULL);
+                        if (!er) el = run_vertex(&L, &dl, wl, types, NULL);
+                        if (!er && !el) {
+                            const char *dump = getenv("MAXMETAL_DIFF_DUMP");   // <dir>: both sides' varyings (64 vertices x 34 x float4)
+                            if (dump) {
+                                [dr writeToFile:[NSString stringWithFormat:@"%s/%s.ryu", dump, argv[i]] atomically:NO];
+                                [dl writeToFile:[NSString stringWithFormat:@"%s/%s.maxmetal", dump, argv[i]] atomically:NO];
+                            }
+                            // varyings maxmetal writes; the Ryujinx path's (0, 0, 0, 1) for one it does not write is not compared
+                            const uint32_t *a2 = dr.bytes, *b2 = dl.bytes;
+                            for (int v = 0; v < 64; v++)
+                                for (int s = 0; s < 34; s++) {
+                                    const uint32_t *x = a2 + (v * 34 + s) * 4, *y = b2 + (v * 34 + s) * 4;
+                                    BOOL zx = !x[0] && !x[1] && !x[2] && !x[3], zy = !y[0] && !y[1] && !y[2] && !y[3];
+                                    if (zx != zy && s < 32) { c.diff++; c.first = c.first ?: [NSString stringWithFormat:@"varying %d written by one only", s]; continue; }
+                                    cmp_words(&c, x, y, s == 33 ? 1 : 4, YES, s == 32 ? @"position" : s == 33 ? @"point size" : [NSString stringWithFormat:@"v%d", s]);
+                                }
+                        }
+                    } else {
+                        er = run_compute(&R, wr, NULL);
+                        if (!er) el = run_compute(&L, wl, NULL);
                     }
-                // timed after the comparison: the timed runs change the stored contents. The side timed first pays for
-                // the GPU warming up (twice the time, 2026-10-30): one untimed round, then two, each side's fastest
-                if (!er && !el && g_time) {
-                    for (int round = 0; round < 3; round++) {
-                        NSData *x = nil, *y = nil;
-                        double a = 0, b = 0;
-                        if ([g_stage isEqual:@"ps"]) { run_fragment(&R, &x, wr, &a); run_fragment(&L, &y, wl, &b); }
-                        else if ([g_stage isEqual:@"vs"]) { run_vertex(&R, &x, wr, types, &a); run_vertex(&L, &y, wl, types, &b); }
-                        else if (run_compute(&R, wr, &a) || run_compute(&L, wl, &b)) { tr = tl = 0; break; }  // (a GPU error: no time)
-                        if (round == 1 || (round > 1 && a < tr)) tr = a;
-                        if (round == 1 || (round > 1 && b < tl)) tl = b;
+                    // stores to storage buffers (both started from the same contents)
+                    if (!er && !el)
+                        for (NSString *k in wr) {
+                            if (!wl[k]) { c.diff++; c.first = c.first ?: [NSString stringWithFormat:@"%@ bound by ryujinx only", k]; continue; }
+                            if ([k hasPrefix:@"img:"]) {   // an image: its texels (uint formats bit for bit)
+                                NSString *fmt = [k componentsSeparatedByString:@":"].lastObject;
+                                NSData *x = image_bytes(wr[k], fmt), *y = image_bytes(wl[k], fmt);
+                                cmp_words(&c, x.bytes, y.bytes, x.length / 4, [fmt isEqual:@""], k);
+                                continue;
+                            }
+                            id<MTLBuffer> x = wr[k], y = wl[k];
+                            cmp_words(&c, x.contents, y.contents, x.length / 4, YES, k);
+                        }
+                    if (!er && !el && g_capped && (c.diff || c.close) && !g_ints) { g_ints = 16; continue; }
+                    // timed after the comparison: the timed runs change the stored contents. The side timed first pays for
+                    // the GPU warming up (twice the time, 2026-10-30): one untimed round, then two, each side's fastest
+                    if (!er && !el && g_time) {
+                        for (int round = 0; round < 3; round++) {
+                            NSData *x = nil, *y = nil;
+                            double a = 0, b = 0;
+                            if ([g_stage isEqual:@"ps"]) { run_fragment(&R, &x, wr, &a); run_fragment(&L, &y, wl, &b); }
+                            else if ([g_stage isEqual:@"vs"]) { run_vertex(&R, &x, wr, types, &a); run_vertex(&L, &y, wl, types, &b); }
+                            else if (run_compute(&R, wr, &a) || run_compute(&L, wl, &b)) { tr = tl = 0; break; }  // (a GPU error: no time)
+                            if (round == 1 || (round > 1 && a < tr)) tr = a;
+                            if (round == 1 || (round > 1 && b < tl)) tl = b;
+                        }
                     }
+                    if (er || el) {
+                        printf(er ? "skip %s ryujinx run: %s\n" : "fail %s maxmetal run: %s\n", argv[i], (er ?: el).UTF8String);
+                        // after a GPU error the system ignores this process's later command buffers: exit (3, as wait_cb)
+                        if ([er ?: el hasPrefix:@"gpu:"]) { fflush(stdout); _exit(3); }
+                        break;
+                    }
+                    // (a side hit the loop cap: its outputs say nothing, unless both still agree)
+                    const char *verdict = g_capped && (c.diff || c.close) ? "capped" : c.diff ? "diff" : c.close ? "close" : "exact";
+                    printf("%s %s %s exact=%llu close=%llu diff=%llu maxrel=%.2g", verdict, argv[i], g_stage.UTF8String,
+                           (unsigned long long)c.exact, (unsigned long long)c.close, (unsigned long long)c.diff, c.maxrel);
+                    if (g_time) printf(" ms_ryujinx=%.4f ms_maxmetal=%.4f", tr, tl);
+                    if (g_capped) printf(" loop_capped=%s", g_capped == 3 ? "both" : g_capped == 1 ? "ryujinx" : "maxmetal");
+                    if (rerun) printf(" inputs=ints");
+                    if (c.first) printf(" first: %s", c.first.UTF8String);
+                    printf("\n");
+                    fflush(stdout);
+                    break;
                 }
-                if (er || el) {
-                    printf(er ? "skip %s ryujinx run: %s\n" : "fail %s maxmetal run: %s\n", argv[i], (er ?: el).UTF8String);
-                    // after a GPU error the system ignores this process's later command buffers: exit (3, as wait_cb)
-                    if ([er ?: el hasPrefix:@"gpu:"]) { fflush(stdout); _exit(3); }
-                    continue;
-                }
-                // (a side hit the loop cap: its outputs say nothing, unless both still agree)
-                const char *verdict = g_capped && (c.diff || c.close) ? "capped" : c.diff ? "diff" : c.close ? "close" : "exact";
-                printf("%s %s %s exact=%llu close=%llu diff=%llu maxrel=%.2g", verdict, argv[i], g_stage.UTF8String,
-                       (unsigned long long)c.exact, (unsigned long long)c.close, (unsigned long long)c.diff, c.maxrel);
-                if (g_time) printf(" ms_ryujinx=%.4f ms_maxmetal=%.4f", tr, tl);
-                if (g_capped) printf(" loop_capped=%s", g_capped == 3 ? "both" : g_capped == 1 ? "ryujinx" : "maxmetal");
-                if (c.first) printf(" first: %s", c.first.UTF8String);
-                printf("\n");
-                fflush(stdout);
             }
         }
     }

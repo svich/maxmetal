@@ -21,9 +21,9 @@ maxmetal does it in one step: Maxwell in, MSL out, in plain C with no dependenci
   to see through, and room for targeted optimizations Ryujinx's general pipeline can't make: a global memory access,
   for example, goes straight to the one storage buffer data flow found for it, unchecked as in Ryujinx.
 - **Same results.** It aims for the emulator route's results, not just plausible ones: on a real game's shader set,
-  31300 of 31307 variants give bit-identical GPU output to Ryujinx + SPIRV-Cross (the rest: five loops the test caps,
-  one mip selection in divergent control flow, one shader whose own stores race), at the same GPU time. Its NVN mode
-  emits the binding layout SPIRV-Cross would, so it can take that pipeline's place without changing the renderer.
+  31305 of 31307 variants give bit-identical GPU output to Ryujinx + SPIRV-Cross (the other two: a mip selection in
+  divergent control flow, a shader whose own stores race), at the same GPU time. Its NVN mode emits the binding
+  layout SPIRV-Cross would, so it can take that pipeline's place without changing the renderer.
 
 Two binding contracts:
 
@@ -140,11 +140,13 @@ Runs both translations of each variant on the GPU with the same random inputs, b
 compares outputs: exact, close, different, capped or skipped. `--time N` also reports GPU time. Random inputs can
 make shaders loop forever, so loops are capped (`MAXMETAL_DIFF_LOOP_CAP`, default 4096, all of a run's loops together;
 `MAXMETAL_DIFF_LOOP_CAP_ENTRY=N` also stops each loop N iterations after it is entered, so equivalent loops stop at
-the same iteration on both sides) and every run times out after `GPU_TIMEOUT` seconds (default 20). Even so, run it
-one process at a time: a GPU hang resets the display for the whole Mac. Other knobs: `MAXMETAL_DIFF_DUMP=<dir>`,
-`MAXMETAL_DIFF_ONE_LEVEL=1`, `MAXMETAL_DIFF_COMPILE_ONLY=1`, `CS_TIME_GROUPS`, `CS_TIME_SCALE`, and for `--time`
-`MAXMETAL_DIFF_TIME_SIZE` (the fragment target's side, default 32) and `MAXMETAL_DIFF_TIME_INSTANCES` (instances of
-the 64 vertices, default 1).
+the same iteration on both sides) and every run times out after `GPU_TIMEOUT` seconds (default 20). A variant that
+hits the cap and differs runs again with its buffers' words integers below 16 instead of floats (`inputs=ints`): loop
+counts read from them stay small and its loops end. Even so, run it one process at a time: a GPU hang resets the
+display for the whole Mac. Other knobs: `MAXMETAL_DIFF_DUMP=<dir>`, `MAXMETAL_DIFF_ONE_LEVEL=1`,
+`MAXMETAL_DIFF_COMPILE_ONLY=1`, `MAXMETAL_DIFF_SEED=<text>` (other random inputs), `MAXMETAL_DIFF_INTS=N` (integers
+below N for every variant), `CS_TIME_GROUPS`, `CS_TIME_SCALE`, and for `--time` `MAXMETAL_DIFF_TIME_SIZE` (the
+fragment target's side, default 32) and `MAXMETAL_DIFF_TIME_INSTANCES` (instances of the 64 vertices, default 1).
 
 ## Environment
 
