@@ -95,6 +95,11 @@ static void emit_recolour(Str *s, const char *c, const char *v3, const char *v4)
     sp(s, "    %s.rgb = mix(%s.rgb, rc_r, %s(rc_m));\n  }\n", c, c, v3);
 }
 
+// (emit_insn) a part of an XMAD multiply: a / breg the registers it read (breg RZ: B is b's text), av / bv their
+// versions (Ctx.ver: a register's writes so far); xs: part 1's copies of a, b and c (xs<n>, xs<n+1>, xs<n+2>), made
+// before it
+typedef struct { uint8_t kind, a, breg; uint32_t av, bv; int xs; char b[80]; } XmPart;
+
 typedef struct {
     const uint8_t *code;   // first instruction group
     size_t ninsts;         // number of 8-byte words to scan
@@ -107,6 +112,7 @@ typedef struct {
     uint32_t in_attr_mask, out_attr_mask;
     uint32_t vs_in_comp[32];
     bool uses_branches, uses_cc, uses_local, uses_vid, uses_iid, uses_frag_coord, uses_front_facing, uses_lane;
+    bool uses_helper;            // (NVN fragment) SR_THREAD_KILL: whether the invocation is a helper, as on entry
     bool uses_point_coord;
     bool uses_rscale;  // resolution-scale table (fragment/compute only)
     uint8_t feat;      // key->features (MAXMETAL_FEAT_*); flip_x implies MAXMETAL_FEAT_RSCALE
@@ -134,10 +140,17 @@ typedef struct {
     bool shared_dyn, uses_shared;
     uint8_t tex_nvn[64];         // NVN texture slot of each texture
     uint8_t wstate[256];         // (fragment) the register holds gl_FragCoord.w (1) / 1 / gl_FragCoord.w (2): the
-                                 // value as last written in this block (Ryujinx EliminateMultiplyByFragmentCoordW)
+                                 // value as last written in this block (Ryujinx EliminateMultiplyByFragmentCoordW),
+                                 // or on entry to it from every path (nvn_structure: swstate)
+    uint32_t wdef[256];          // ... the pc of the IPA / MUFU.RCP that wrote it
     struct { uint8_t src, k; } qshf[256];  // (NVN fragment) the register holds SHFL.BFLY r<src>, k (1 / 2, c 0x1c03) as
                                  // written in this block, k 0: not (Ryujinx MatchDdxOrDdy); qnew: the one emit_insn wrote
     int qnew_d, qnew_src, qnew_k;
+    // the register holds XMAD a.lo * b.lo + c (1) / XMAD.MRG a.lo * b.hi (2) as written in this block: the multiply
+    // idioms emit_insn folds (XmPart)
+    XmPart xm[256], xnew;        // xnew: the one emit_insn wrote (kind 0: none), xnew_d its register
+    int xnew_d, nxs;
+    uint32_t ver[256];
     bool structured;             // the body is structured control flow (nvn_structure), not the pc state machine
     // (NVN: nvn_gflow) while the blocks are emitted, each one's register writes and global memory accesses; gpred: the
     // predicate of the instruction being emitted (gflow_pred)
@@ -241,9 +254,10 @@ static const char *cbuf_ref(Ctx *c, int idx, int64_t off, const char *dyn, char 
                 if (off >= base && off < base + 0x100) c->sslot |= 1u << ((off - base) >> 4);
             }
         }
-        if (dyn)  // past the 64 KiB bank: 0, as Maxwell reads a constant buffer out of range
-            sprintf(buf, "((((%s) + %lldu) >> 4u) < 4096u ? (*spvDescriptorSet0.%s_c%d)._m0[(((%s) + %lldu) >> 4u)][(((%s) + %lldu) >> 2u) & 3u] : 0u)",
-                    dyn, (long long)off, c->pfx, idx, dyn, (long long)off, dyn, (long long)off);
+        if (dyn)  // unchecked, as the Ryujinx path's: past the bank the GPU reads 0 there too (a guarded load is a branch,
+                  // Metal does not speculate it; a clamp and a select, two more operations per load)
+            sprintf(buf, "(*spvDescriptorSet0.%s_c%d)._m0[(((%s) + %lldu) >> 4u)][(((%s) + %lldu) >> 2u) & 3u]",
+                    c->pfx, idx, dyn, (long long)off, dyn, (long long)off);
         else
             sprintf(buf, "(*spvDescriptorSet0.%s_c%d)._m0[%lldu][%lld]", c->pfx, idx, (long long)(off >> 4), (long long)((off >> 2) & 3));
         return buf;
@@ -1084,8 +1098,9 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     if (dc) {
         c->reg_used[pr] = 1;
         // (NVN) Maxwell rounds a 2D-array compare's reference to the 16-bit depth first (cascaded shadow maps; as the
-        // Ryujinx path's depth sampling)
-        sprintf(dref, nvn_on(c) && type == TEXTYPE_2D_ARRAY ? "maxmetal_d16ref(as_type<float>(r%d))" : "as_type<float>(r%d)", pr);
+        // Ryujinx path's depth sampling, which rounds it in compares at an explicit level only)
+        sprintf(dref, nvn_on(c) && type == TEXTYPE_2D_ARRAY && strstr(lod, "level(") ? "maxmetal_d16ref(as_type<float>(r%d))"
+                                                                                      : "as_type<float>(r%d)", pr);
         pr++;
     }
     const char *vec = ncoord == 1 ? "" : ncoord == 2 ? "float2" : "float3";
@@ -1108,8 +1123,8 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
 // gp (the slot's words), go (the byte offset in it) and gok (found).
 // The code (structured, or without branches) tracks the slots by data flow too (nvn_gflow): an access whose address's
 // high word can only come from one slot's c0 entry goes there, its offset the low words' difference (MAXMETAL_GAT), as
-// Ryujinx's single-target access (constant offsets fold to constant indices), but within the slot's size: an unbound
-// slot is a small dummy buffer (in the renderer), past which Ryujinx's unchecked accesses read. From a few slots it tests
+// Ryujinx's single-target access (constant offsets fold to constant indices), unchecked as that (gok true): a test of
+// the slot's size made small compute dispatches 1.2x the Ryujinx path's GPU time (2026-10-30). From a few slots it tests
 // just those (MAXMETAL_GIN), as Ryujinx's multi-target access; the rest search (MAXMETAL_GFIND), as yuzu. Until the flow is
 // known the access is MAXMETAL_GACC(ga, <its number>).
 
@@ -1486,6 +1501,19 @@ static void emit_ldc(Ctx *c, uint64_t w, int d, int a) {
     }
     char rb[16];
     const char *dyn = a == RZ ? NULL : reg(c, a, rb);
+    if (nvn_on(c) && dyn) {  // Ryujinx EmitLdc's form: the word index once, word k at index + k (the compiler sees that
+                             // an LDC.64's two words share a row and loads it once; from each word's byte address it does not)
+        char cb[256];
+        cbuf_ref(c, idx, off, dyn, cb);  // (the bank's use)
+        c->info->cbuf_size[idx] = 0x10000;
+        sp(&c->body, "    { uint lw = (%s + %lldu) >> 2u;\n", dyn, (long long)off);
+        for (int i = 0; i < n && d + i < RZ; i++) {
+            c->reg_used[d + i] = 1;
+            sp(&c->body, "      r%d = (*spvDescriptorSet0.%s_c%d)._m0[(lw + %du) >> 2u][(lw + %du) & 3u];\n", d + i, c->pfx, idx, i, i);
+        }
+        sp(&c->body, "    }\n");
+        return;
+    }
     // LDC.64 R4, c[i][R4 + x]: the address register is also a destination. Read it once before the writes, or
     // the second word comes from c[i][<first word> + x + 4]
     bool overlap = dyn && n > 1 && a >= d && a < d + n;
@@ -1592,7 +1620,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         c->ipa_mul = (int)bits(w, 20, 8);
         attr_load(c, d, addr, NULL);
         c->ipa_mode = -1;
-        if (addr == 0x7C && !guarded && !bits(w, 51, 1) && d != RZ) c->wstate[d] = 1;  // gl_FragCoord.w
+        if (addr == 0x7C && !guarded && !bits(w, 51, 1) && d != RZ) { c->wstate[d] = 1; c->wdef[d] = pc; }  // gl_FragCoord.w
         if (bits(w, 51, 1) && d != RZ) sp(&c->body, "    r%d = as_type<uint>(saturate(as_type<float>(r%d)));\n", d, d);
     } else if (OPM(0xefd8000000000000ull, 0xfff8000000000000ull)) {  // LD attribute
         int n = 1 + (int)bits(w, 47, 2);
@@ -1687,7 +1715,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         }
         bool rcpw = fn == 4 && a != RZ && c->wstate[a] == 1 && !bits(w, 48, 1) && !bits(w, 46, 1) && !bits(w, 50, 1) && !guarded;
         set_reg(c, d, FRES(t, bits(w, 50, 1)));
-        if (rcpw && d != RZ) c->wstate[d] = 2;  // 1 / gl_FragCoord.w
+        if (rcpw && d != RZ) { c->wstate[d] = 2; c->wdef[d] = pc; }  // 1 / gl_FragCoord.w
     } else if (OPM(0x5c90000000000000ull, 0xfff8000000000000ull) || OPM(0x4c90000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x3890000000000000ull, 0xfef8000000000000ull)) {  // RRO: range reduction (no-op for us)
         const char *x = NA(F(B(true)), bits(w, 45, 1), bits(w, 49, 1));
@@ -1837,16 +1865,19 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         if (sz == 0) sprintf(src, sgn ? "int(char((%s >> %d) & 0xFF))" : "((%s >> %d) & 0xFFu)", bv, sel * 8);
         else if (sz == 1) sprintf(src, sgn ? "int(short((%s >> %d) & 0xFFFF))" : "((%s >> %d) & 0xFFFFu)", bv, sel * 8);
         else sprintf(src, sgn ? "int(%s)" : "%s", bv);
+        // |x| and -x apply to the integer, before the conversion (Ryujinx EmitI2F: IAbsNeg; -0 is never made)
+        char an[320];
+        if (bits(w, 49, 1)) { snprintf(an, sizeof an, sgn ? "abs(%s)" : "uint(abs(int(%s)))", src); strcpy(src, an); }
+        if (bits(w, 45, 1)) { snprintf(an, sizeof an, sgn ? "(-%s)" : "(0u - %s)", src); strcpy(src, an); }
         sprintf(u, "float(%s)", src);
         if (bits(w, 8, 2) == 3) {  // F64 (d64_set)
-            d64_set(c, d, NA(u, bits(w, 45, 1), bits(w, 49, 1)));
+            d64_set(c, d, u);
         } else if (bits(w, 8, 2) == 1) {  // F16 result in the low half
             char h[700];
-            snprintf(h, sizeof h, c->glsl ? "(packHalf2x16(vec2(%s, 0.0f)))" : "(uint(as_type<ushort>(half(%s))))",
-                     NA(u, bits(w, 45, 1), bits(w, 49, 1)));
+            snprintf(h, sizeof h, c->glsl ? "(packHalf2x16(vec2(%s, 0.0f)))" : "(uint(as_type<ushort>(half(%s))))", u);
             set_reg(c, d, h);
         } else {
-            set_reg(c, d, FRES(NA(u, bits(w, 45, 1), bits(w, 49, 1)), false));
+            set_reg(c, d, FRES(u, false));
         }
     } else if (OPM(0x5ca8000000000000ull, 0xfff8000000000000ull) || OPM(0x4ca8000000000000ull, 0xfff8000000000000ull) ||
                OPM(0x38a8000000000000ull, 0xfef8000000000000ull)) {  // F2F (formats: 1 F16, 2 F32; bit 41 = high half)
@@ -2106,23 +2137,56 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         }
         bool sa = bits(w, 48, 1), sb = bits(w, 49, 1), wcc = bits(w, 47, 1);
         if (ext || wcc) c->uses_cc = true;
-        sp(&c->body, "    { uint xa = (%s >> %d) & 0xFFFFu; uint xb = (%s >> %d) & 0xFFFFu; uint xbu = %s;\n", R(a), ha ? 16 : 0, bv, hb ? 16 : 0, bv);
-        if (sa) sp(&c->body, "      xa = uint(int(short(xa)));\n");
-        if (sb) sp(&c->body, "      xb = uint(int(short(xb)));\n");
-        sp(&c->body, "      uint prod = xa * xb;%s\n", psl ? " prod <<= 16;" : "");
-        switch (cmode) {
-        case 1: sp(&c->body, "      uint cc_ = %s & 0xFFFFu;\n", cv); break;                                  // clo
-        case 2: sp(&c->body, "      uint cc_ = %s >> 16;\n", cv); break;                                      // chi
-        case 3: sp(&c->body, "      uint cc_ = %s - (((xa >> 31) << 16) + ((xb >> 31) << 16));\n", cv); break;  // csfu
-        case 4: sp(&c->body, "      uint cc_ = %s + (xbu << 16);\n", cv); break;                              // cbcc
-        default: sp(&c->body, "      uint cc_ = %s;\n", cv);                                                  // cfull
+        // Ryujinx's XmadOptimizer: the idioms of a 32-bit multiply, a * b + c (low 32 bits, the same bits) in one
+        //   t = XMAD a, b, c;  u = XMAD.MRG a, b.H1, RZ;  d = XMAD.PSL.CBCC a.H1, u.H1, t    (32 x 32)
+        //   t = XMAD a, b, c;  d = XMAD.PSL a.H1, b, t                                       (32 x 16: b's low half)
+        int breg = top == 0x5b ? (int)bits(w, 20, 8) : top == 0x51 ? (int)bits(w, 39, 8) : RZ;
+        int creg = top == 0x51 ? -1 : (int)bits(w, 39, 8);
+        bool plain = !sa && !sb && !ext && !wcc && !guarded && a != RZ;
+        // (the same b: the same register unwritten between, or the same immediate / constant)
+        #define XM_SAME_B(p, r, v, txt) ((p)->breg == (r) && ((r) == RZ ? !strcmp((p)->b, (txt)) : (p)->bv == (v)))
+        const XmPart *xt = creg >= 0 && creg < RZ && c->xm[creg].kind == 1 ? &c->xm[creg] : NULL;
+        const XmPart *xu = top == 0x5b && breg < RZ && c->xm[breg].kind == 2 ? &c->xm[breg] : NULL;
+        bool at_a = xt && xt->a == a && xt->av == c->ver[a];
+        if (plain && ha && hb && psl && !mrg && cmode == 4 && at_a && xu && xu->a == a && xu->av == xt->av &&
+            XM_SAME_B(xu, xt->breg, xt->bv, xt->b)) {
+            sprintf(t, "((xs%d * xs%d) + xs%d)", xt->xs, xt->xs + 1, xt->xs + 2);
+            set_reg(c, d, t);
+        } else if (plain && ha && !hb && psl && !mrg && cmode == 0 && at_a && XM_SAME_B(xt, breg, breg < RZ ? c->ver[breg] : 0, bv)) {
+            sprintf(t, "((xs%d * (xs%d & 0xFFFFu)) + xs%d)", xt->xs, xt->xs + 1, xt->xs + 2);
+            set_reg(c, d, t);
+        } else {
+            if (plain && !ha && !psl && cmode == 0 && d != RZ && creg >= 0 && strlen(bv) < sizeof c->xm[0].b &&
+                ((!hb && !mrg) || (hb && mrg && creg == RZ))) {  // t / u (recorded after the write: xm_writes)
+                c->xnew = (XmPart){.kind = (uint8_t)(hb ? 2 : 1), .a = (uint8_t)a, .breg = (uint8_t)breg, .av = c->ver[a],
+                                   .bv = breg < RZ ? c->ver[breg] : 0, .xs = -1};
+                strcpy(c->xnew.b, bv);
+                c->xnew_d = d;
+                if (!hb) {  // t: a, b and c as they are now (a later part may write over them)
+                    char cr[16];
+                    c->xnew.xs = c->nxs; c->nxs += 3;
+                    sp(&c->body, "    xs%d = %s; xs%d = %s; xs%d = %s;\n", c->xnew.xs, R(a), c->xnew.xs + 1, bv, c->xnew.xs + 2, reg(c, creg, cr));
+                }
+            }
+            sp(&c->body, "    { uint xa = (%s >> %d) & 0xFFFFu; uint xb = (%s >> %d) & 0xFFFFu; uint xbu = %s;\n", R(a), ha ? 16 : 0, bv, hb ? 16 : 0, bv);
+            if (sa) sp(&c->body, "      xa = uint(int(short(xa)));\n");
+            if (sb) sp(&c->body, "      xb = uint(int(short(xb)));\n");
+            sp(&c->body, "      uint prod = xa * xb;%s\n", psl ? " prod <<= 16;" : "");
+            switch (cmode) {
+            case 1: sp(&c->body, "      uint cc_ = %s & 0xFFFFu;\n", cv); break;                                  // clo
+            case 2: sp(&c->body, "      uint cc_ = %s >> 16;\n", cv); break;                                      // chi
+            case 3: sp(&c->body, "      uint cc_ = %s - (((xa >> 31) << 16) + ((xb >> 31) << 16));\n", cv); break;  // csfu
+            case 4: sp(&c->body, "      uint cc_ = %s + (xbu << 16);\n", cv); break;                              // cbcc
+            default: sp(&c->body, "      uint cc_ = %s;\n", cv);                                                  // cfull
+            }
+            if (ext) sp(&c->body, "      uint res = prod + (cc & 1u);\n");
+            else sp(&c->body, "      uint res = prod + cc_;\n");
+            if (wcc) sp(&c->body, "      cc = (res < prod) ? 1u : 0u;\n");
+            if (mrg) sp(&c->body, "      res = (res & 0xFFFFu) | (xbu << 16);\n");
+            if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = res;\n", d); }
+            sp(&c->body, "    }\n");
         }
-        if (ext) sp(&c->body, "      uint res = prod + (cc & 1u);\n");
-        else sp(&c->body, "      uint res = prod + cc_;\n");
-        if (wcc) sp(&c->body, "      cc = (res < prod) ? 1u : 0u;\n");
-        if (mrg) sp(&c->body, "      res = (res & 0xFFFFu) | (xbu << 16);\n");
-        if (d != RZ) { c->reg_used[d] = 1; sp(&c->body, "      r%d = res;\n", d); }
-        sp(&c->body, "    }\n");
+        #undef XM_SAME_B
     } else if (OPM(0x5090000000000000ull, 0xfff8000000000000ull)) {  // PSETP
         const char *pa = P((int)bits(w, 12, 3), bits(w, 15, 1)), *pb = P((int)bits(w, 29, 3), bits(w, 32, 1));
         const char *pcc = P((int)bits(w, 39, 3), bits(w, 42, 1));
@@ -2145,7 +2209,11 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
             if ((sr == 0x00 || (sr >= 0x38 && sr <= 0x3c)) && lanes) c->uses_lane = true;
             switch (sr) {
             case 0x00: set_reg(c, d, lanes ? "lane" : "0u"); break;
-            case 0x11: case 0x13: case 0x1d: set_reg(c, d, "0u"); break;  // invocation id, thread kill, invocation info
+            case 0x13:  // thread kill: a helper invocation (Ryujinx: gl_HelperInvocation, read on entry), not in other stages
+                if (c->stage == STAGE_FRAGMENT) { c->uses_helper = true; set_reg(c, d, "(maxmetal_helper ? 0xFFFFFFFFu : 0u)"); }
+                else set_reg(c, d, "0u");
+                break;
+            case 0x11: case 0x1d: set_reg(c, d, "0u"); break;  // invocation id, invocation info
             case 0x12: set_reg(c, d, "0x3f800000u"); break;  // y direction: +1 (origin upper left, no flip)
             case 0x20: set_reg(c, d, c->stage == STAGE_COMPUTE ? "(tid.x | (tid.y << 16) | (tid.z << 26))" : "0u"); break;
             case 0x21: case 0x22: case 0x23: case 0x25: case 0x26: case 0x27:
@@ -3040,6 +3108,7 @@ static ShaderInfo *glsl_finish(Ctx *c, bool any_branch, bool dbg) {
     }
     for (int i = 0; i < 256; i++)
         if (c->reg_used[i]) sp(&s, "  uint r%d = 0u;\n", i);
+    for (int i = 0; i < c->nxs; i++) sp(&s, "  uint xs%d = 0u;\n", i);
     for (int i = 0; i < 7; i++)
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0u; bool ccz = false, ccs = false;\n");
@@ -3290,8 +3359,7 @@ typedef struct {
     int nx, *xs;             // BRX: its targets (instead of succ) ...
     uint32_t *xv;            // ... and the addresses that go there
     bool seen, loop, merge;  // reached; target of a back edge; branched to (not placed inline)
-    uint8_t sn[3];           // SSY / PBK / PCNT stacks on entry
-    uint32_t sv[3][16];
+    bool seen2;              // (sbuild) its edges set
     int rpo, idom, nfwd;
     int hdr;                 // innermost loop (header block) whose body holds this block, -1 none
     int place;               // the block whose code holds this one's: idom, or a loop it leaves
@@ -3332,7 +3400,7 @@ static uint32_t starget(uint64_t w, uint32_t i) { return norm_target((int64_t)i 
 static int sdeg(const SBlk *b) { return b->nx ? b->nx : 2; }
 static int sget(const SBlk *b, int e) { return b->nx ? b->xs[e] : b->succ[e]; }
 
-// blocks, branch stacks resolved per block (a block reached with two different stacks: false), successors
+// blocks, the targets of their stack pops (SYNC / BRK / CONT), successors
 static bool sbuild(SProg *g, size_t end, const uint8_t *label) {
     g->b = calloc(end + 1, sizeof *g->b);
     int *of = malloc((end + 1) * sizeof *of);
@@ -3350,26 +3418,33 @@ static bool sbuild(SProg *g, size_t end, const uint8_t *label) {
         cut = f != SF_NONE;
     }
     of[end] = -1;
-    int *wl = malloc((g->nb + 1) * sizeof *wl), nwl = 0;
+    // The SSY / PBK / PCNT entries on entry, one stack as the state machine's (emit_insn: SYNC / BRK / CONT drop the
+    // entries of other kinds above theirs). A block may be reached with different stacks (a BRK out of an SSY region
+    // leaves its entry; Ryujinx's decoder: one stack, PropagatePushOp), up to SB_STACKS of them, as long as each of its
+    // pops goes to the same target from all of them: the structure follows the edges, not the stacks.
+    enum { SB_STACKS = 8 };
+    typedef struct { uint8_t n, kind[16]; uint32_t v[16]; } Stk;
+    Stk *st = calloc((size_t)g->nb * SB_STACKS, sizeof *st);
+    uint8_t *nst = calloc(g->nb + 1, 1);
+    int *wl = malloc(((size_t)g->nb * SB_STACKS + 1) * sizeof *wl), nwl = 0;  // block * SB_STACKS + its stack
     bool ok = g->nb > 0;
-    if (ok) { g->b[0].seen = true; wl[nwl++] = 0; }
+    if (ok) { g->b[0].seen = true; nst[0] = 1; wl[nwl++] = 0; }
     while (ok && nwl) {
-        int k = wl[--nwl];
+        int k = wl[nwl - 1] / SB_STACKS;
+        Stk sk = st[wl[--nwl]];
         SBlk *b = &g->b[k];
-        uint8_t sn[3]; uint32_t sv[3][16];
-        memcpy(sn, b->sn, sizeof sn); memcpy(sv, b->sv, sizeof sv);
         for (uint32_t i = b->first; i < b->last; i++) {
             uint64_t w = g->code[i], t = w & 0xfff0000000000020ull;
             int s = t == 0xe290000000000000ull ? 0 : t == 0xe2a0000000000000ull ? 1 : t == 0xe2b0000000000000ull ? 2 : -1;
             if (i % 4 == 0 || s < 0) continue;
-            if (sn[s] == 16) { ok = false; break; }
-            sv[s][sn[s]++] = starget(w, i);
+            if (sk.n == 16) { ok = false; break; }
+            sk.kind[sk.n] = (uint8_t)s; sk.v[sk.n++] = starget(w, i);
         }
         if (!ok) break;
         uint64_t w = g->code[b->last - 1];
-        b->cond = b->term != SF_NONE && sflow_cond(w);
-        b->succ[0] = b->succ[1] = -1;
-        uint8_t tn[3]; memcpy(tn, sn, sizeof tn);  // the taken edge's stacks (a pop)
+        bool cond = b->term != SF_NONE && sflow_cond(w);
+        Stk tk = sk;  // the taken edge's stack (a pop)
+        int succ0 = -1, succ1 = -1;
         uint32_t tgt = 0;
         bool has_t = true;
         switch (b->term) {
@@ -3377,49 +3452,60 @@ static bool sbuild(SProg *g, size_t end, const uint8_t *label) {
         case SF_BRA: tgt = starget(w, b->last - 1); break;
         case SF_SYNC: case SF_BRK: case SF_CONT: {
             int s = b->term - SF_SYNC;
-            if (!sn[s]) { ok = false; break; }
-            tgt = sv[s][sn[s] - 1];
-            if (b->term != SF_CONT) tn[s]--;
+            while (tk.n && tk.kind[tk.n - 1] != s) tk.n--;
+            if (!tk.n) { ok = false; break; }
+            tgt = tk.v[tk.n - 1];
+            if (b->term != SF_CONT) tk.n--;
             break;
         }
-        case SF_EXIT: case SF_KIL: b->succ[0] = SB_EXIT; has_t = false; break;
-        case SF_BRX: {
+        case SF_EXIT: case SF_KIL: succ0 = SB_EXIT; has_t = false; break;
+        case SF_BRX:
             has_t = false;
-            uint32_t tv[256];
-            int n = b->cond ? 0 : sbrx(g->c, g->code, b->last - 1, tv, 256);
-            if (!n) { ok = false; break; }
-            b->xs = malloc(n * sizeof *b->xs); b->xv = malloc(n * sizeof *b->xv);
-            b->nx = n;
-            for (int e = 0; e < n && ok; e++) {
-                uint32_t t = norm_target(tv[e]) / 8;
-                if (t >= end || of[t] < 0 || g->b[of[t]].first != t) { ok = false; break; }
-                b->xs[e] = of[t]; b->xv[e] = tv[e];
+            if (!b->nx) {  // (its targets: from the first stack, they do not depend on it)
+                uint32_t tv[256];
+                int n = cond ? 0 : sbrx(g->c, g->code, b->last - 1, tv, 256);
+                if (!n) { ok = false; break; }
+                b->xs = malloc(n * sizeof *b->xs); b->xv = malloc(n * sizeof *b->xv);
+                b->nx = n;
+                for (int e = 0; e < n && ok; e++) {
+                    uint32_t t = norm_target(tv[e]) / 8;
+                    if (t >= end || of[t] < 0 || g->b[of[t]].first != t) { ok = false; break; }
+                    b->xs[e] = of[t]; b->xv[e] = tv[e];
+                }
             }
             break;
-        }
         }
         if (!ok) break;
         if (has_t) {
             if (tgt >= end || of[tgt] < 0 || g->b[of[tgt]].first != tgt) { ok = false; break; }
-            b->succ[0] = of[tgt];
+            succ0 = of[tgt];
         }
-        if (b->term == SF_NONE || b->cond) b->succ[1] = k + 1 < g->nb ? k + 1 : SB_EXIT;
-        if (b->succ[0] == b->succ[1] && memcmp(tn, sn, 3) == 0) { b->succ[1] = -1; b->cond = false; }
-        for (int e = 0; e < sdeg(b) && ok; e++) {
-            int y = sget(b, e);
+        if (b->term == SF_NONE || cond) succ1 = k + 1 < g->nb ? k + 1 : SB_EXIT;
+        if (!b->seen2) {
+            b->seen2 = true;
+            b->cond = cond && succ0 != succ1;
+            b->succ[0] = succ0; b->succ[1] = succ0 == succ1 ? -1 : succ1;  // (both edges to one block: one edge)
+        } else if (b->succ[0] != succ0 || b->succ[1] != (succ0 == succ1 ? -1 : succ1)) {
+            ok = false;  // (another stack's pop goes elsewhere)
+        }
+        for (int e = 0; e < (b->nx ? b->nx : 2) && ok; e++) {
+            int y = b->nx ? b->xs[e] : e == 0 ? succ0 : succ1;
             if (y < 0) continue;
-            const uint8_t *yn = e == 0 && !b->nx ? tn : sn;
+            const Stk *yk = e == 0 && !b->nx ? &tk : &sk;
             SBlk *t = &g->b[y];
-            if (!t->seen) {
-                t->seen = true;
-                memcpy(t->sn, yn, 3); memcpy(t->sv, sv, sizeof sv);
-                wl[nwl++] = y;
-            } else {
-                for (int s = 0; s < 3 && ok; s++)
-                    ok = t->sn[s] == yn[s] && !memcmp(t->sv[s], sv[s], yn[s] * sizeof(uint32_t));
+            t->seen = true;
+            bool have = false;
+            for (int q = 0; q < nst[y] && !have; q++) {
+                const Stk *o = &st[(size_t)y * SB_STACKS + q];
+                have = o->n == yk->n && !memcmp(o->kind, yk->kind, yk->n) && !memcmp(o->v, yk->v, yk->n * sizeof *yk->v);
             }
+            if (have) continue;
+            if (nst[y] == SB_STACKS) { ok = false; break; }
+            st[(size_t)y * SB_STACKS + nst[y]] = *yk;
+            wl[nwl++] = y * SB_STACKS + nst[y]++;
         }
     }
+    free(st); free(nst);
     // a KIL block only one conditional branch reaches, as the code it skips (between the branch and its forward target),
     // goes on to the target: Ryujinx's structure if (p) { discard } target... (its Discard ends a block with no successor;
     // a KIL block that is the target, after the code the branch falls into, stays apart: if (p) { ... } discard)
@@ -3764,8 +3850,8 @@ static int gflow_pred(uint64_t w) {
 }
 
 // c->qshf after an instruction's code s: a register it writes no longer holds a shuffle, nor does one shuffled from it;
-// then the shuffle it wrote
-static void qshf_writes(Ctx *c, const char *s, size_t n) {
+// then the shuffle it wrote. Nor gl_FragCoord.w or 1 / w (c->wstate), unless this instruction (pc) made it that.
+static void qshf_writes(Ctx *c, const char *s, size_t n, uint32_t pc) {
     for (size_t i = 0; i + 1 < n; i++) {
         if (s[i] != 'r' || !isdigit((unsigned char)s[i + 1]) ||
             (i && (isalnum((unsigned char)s[i - 1]) || s[i - 1] == '_' || s[i - 1] == '.'))) continue;
@@ -3773,6 +3859,7 @@ static void qshf_writes(Ctx *c, const char *s, size_t n) {
         int reg = 0;
         while (j < n && isdigit((unsigned char)s[j])) reg = reg * 10 + (s[j++] - '0');
         if (j + 3 > n || memcmp(s + j, " = ", 3) || reg >= 256) continue;
+        if (c->wdef[reg] != pc) c->wstate[reg] = 0;
         c->qshf[reg].k = 0;
         for (int r = 0; r < 256; r++)
             if (c->qshf[r].src == reg) c->qshf[r].k = 0;
@@ -3780,14 +3867,32 @@ static void qshf_writes(Ctx *c, const char *s, size_t n) {
     if (c->qnew_k) c->qshf[c->qnew_d] = (typeof(c->qshf[0])){.src = (uint8_t)c->qnew_src, .k = (uint8_t)c->qnew_k};
 }
 
+// c->xm after an instruction's code s: a register it writes holds no XMAD part (and its version goes up); then the part
+// it wrote
+static void xm_writes(Ctx *c, const char *s, size_t n) {
+    for (size_t i = 0; i + 1 < n; i++) {
+        if (s[i] != 'r' || !isdigit((unsigned char)s[i + 1]) ||
+            (i && (isalnum((unsigned char)s[i - 1]) || s[i - 1] == '_' || s[i - 1] == '.'))) continue;
+        size_t j = i + 1;
+        int reg = 0;
+        while (j < n && isdigit((unsigned char)s[j])) reg = reg * 10 + (s[j++] - '0');
+        if (j + 3 > n || memcmp(s + j, " = ", 3) || reg >= 256) continue;
+        c->xm[reg].kind = 0;
+        c->ver[reg]++;
+    }
+    if (c->xnew.kind) c->xm[c->xnew_d] = c->xnew;
+}
+
 // emit_insn, noting the instruction's writes for nvn_gflow while c->gtrack
 static void gflow_insn(Ctx *c, uint64_t w, uint32_t pc) {
     size_t at = c->body.len;
     c->gpred = gflow_pred(w);
     c->qnew_k = 0;
+    c->xnew.kind = 0;
     emit_insn(c, w, pc);
     if (c->gtrack || c->itrack) gflow_writes(c, c->body.buf + at, c->body.len - at);
-    if (c->nvn && c->stage == STAGE_FRAGMENT) qshf_writes(c, c->body.buf + at, c->body.len - at);
+    if (c->nvn && c->stage == STAGE_FRAGMENT) qshf_writes(c, c->body.buf + at, c->body.len - at, pc);
+    xm_writes(c, c->body.buf + at, c->body.len - at);
 }
 
 // MAXMETAL_IACC(<id>) in code -> the view of the image slot whose c2 entry the image op's handle comes from (acc[id]: its
@@ -3926,6 +4031,25 @@ static void nvn_iflow(Ctx *c) {
     free(acc);
 }
 
+// a branch target's wstate on entry: the registers every block going there (all translated before it: no back edge)
+// leaves holding the same IPA / MUFU.RCP result, one definition on every path as Ryujinx's SSA sees it. A KIL block's
+// edge does not count: Ryujinx's Discard ends its block with no successor (sbuild).
+static void swstate(const SProg *g, int k, uint8_t (*ws)[256], uint32_t (*wd)[256], Ctx *c) {
+    bool any = false;
+    memset(c->wstate, 0, sizeof c->wstate);
+    for (int x = 0; x < g->nb; x++) {
+        const SBlk *p = &g->b[x];
+        bool edge = false;
+        for (int e = 0; p->seen && p->term != SF_KIL && e < sdeg(p); e++) edge |= sget(p, e) == k;
+        if (!edge) continue;
+        if (x >= k) { memset(c->wstate, 0, sizeof c->wstate); return; }
+        for (int r = 0; r < 256; r++)
+            if (!any) { c->wstate[r] = ws[x][r]; c->wdef[r] = wd[x][r]; }
+            else if (c->wstate[r] != ws[x][r] || c->wdef[r] != wd[x][r]) c->wstate[r] = 0;
+        any = true;
+    }
+}
+
 // the body as structured code into c->body; false (nothing emitted): the caller uses the state machine
 static bool nvn_structure(Ctx *c, const uint64_t *code, size_t end, const uint8_t *label, bool annotate) {
     SProg g = {.c = c, .code = code};
@@ -3938,11 +4062,13 @@ static bool nvn_structure(Ctx *c, const uint64_t *code, size_t end, const uint8_
     if (ok) {
         Str body = c->body;
         c->gtrack = true;
+        uint8_t (*ws)[256] = calloc(g.nb, sizeof *ws);
+        uint32_t (*wd)[256] = calloc(g.nb, sizeof *wd);
         for (int k = 0; k < g.nb && !c->fail; k++) {  // every block in address order (as the state machine)
             SBlk *b = &g.b[k];
             c->gblk = k;
             c->body = (Str){0};
-            if (label[b->first]) { memset(c->wstate, 0, sizeof c->wstate); memset(c->qshf, 0, sizeof c->qshf); }
+            if (label[b->first]) { swstate(&g, k, ws, wd, c); memset(c->qshf, 0, sizeof c->qshf); memset(c->xm, 0, sizeof c->xm); }
             for (uint32_t i = b->first; i < b->last; i++) {
                 if (i % 4 == 0) continue;
                 uint64_t w = code[i], t = w & 0xfff0000000000020ull;
@@ -3953,7 +4079,9 @@ static bool nvn_structure(Ctx *c, const uint64_t *code, size_t end, const uint8_
                 gflow_insn(c, w, i * 8);
             }
             b->code = c->body;
+            memcpy(ws[k], c->wstate, sizeof c->wstate); memcpy(wd[k], c->wdef, sizeof c->wdef);
         }
+        free(ws); free(wd);
         c->body = body;
         c->gtrack = false;
         if (!c->fail) nvn_gflow(&g);
@@ -4129,7 +4257,7 @@ static ShaderInfo *nvn_finish(Ctx *c, bool any_branch) {
         // gsn: main0), which compiles faster than a test per slot at every access
         int nslot = __builtin_popcount(c->sslot) + __builtin_popcount(c->uslot);
         const char *cq = gstore ? "" : "const ";
-        sp(&s, "#define MAXMETAL_GAT(ga, k) %sdevice uint *gp = (*spvDescriptorSet0.%s_##k)._m0; uint go = uint(ga) - gk_##k.x; const bool gok = go < gk_##k.z;\n", cq, pfx);
+        sp(&s, "#define MAXMETAL_GAT(ga, k) %sdevice uint *gp = (*spvDescriptorSet0.%s_##k)._m0; uint go = uint(ga) - gk_##k.x; const bool gok = true;\n", cq, pfx);
         sp(&s, "#define MAXMETAL_GDECL %sdevice uint *gp = nullptr; uint go = 0u;\n", cq);
         sp(&s, "#define MAXMETAL_GIN(ga, x) if ((ga) - gb_##x < ulong(gn_##x)) { gp = (*spvDescriptorSet0.%s_##x)._m0; go = uint((ga) - gb_##x); }\n", pfx);
         sp(&s, "#define MAXMETAL_GOK const bool gok = gp != nullptr;\n");
@@ -4236,8 +4364,10 @@ static ShaderInfo *nvn_finish(Ctx *c, bool any_branch) {
         sp(&s, "    %sdevice uint *gsp[] = {%s};\n    ulong gsb[] = {%s};\n    uint gsn[] = {%s};\n", gstore ? "" : "const ", p.buf, b.buf, n.buf);
         free(p.buf); free(b.buf); free(n.buf);
     }
+    if (c->uses_helper) sp(&s, "    const bool maxmetal_helper = simd_is_helper_thread();\n");
     for (int i = 0; i < 256; i++)
         if (c->reg_used[i]) sp(&s, "    uint r%d = 0;\n", i);
+    for (int i = 0; i < c->nxs; i++) sp(&s, "    uint xs%d = 0u;\n", i);
     for (int i = 0; i < 7; i++)
         if (c->pred_used[i]) sp(&s, "    bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "    uint cc = 0; bool ccz = false, ccs = false;\n");
@@ -4426,6 +4556,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
             if (c->itrack) c->gblk++;  // (nvn_iflow: a block starts)
             memset(c->wstate, 0, sizeof c->wstate);
             memset(c->qshf, 0, sizeof c->qshf);
+            memset(c->xm, 0, sizeof c->xm);
         }
         if (annotate) sp(&c->body, "    // pc %x: %016llx\n", pc, (unsigned long long)((const uint64_t *)code)[i]);
         gflow_insn(c, ((const uint64_t *)code)[i], pc);
@@ -4568,6 +4699,7 @@ ShaderInfo *maxwell_translate(const uint8_t *blob, size_t max_size, int stage, c
         for (int i = 0; i < info->ntex; i++) sp(&s, "  sampler s%d = ss[smap[%d]];\n", i, i);
     for (int i = 0; i < 256; i++)
         if (c->reg_used[i]) sp(&s, "  uint r%d = 0;\n", i);
+    for (int i = 0; i < c->nxs; i++) sp(&s, "  uint xs%d = 0u;\n", i);
     for (int i = 0; i < 7; i++)
         if (c->pred_used[i]) sp(&s, "  bool p%d = false;\n", i);
     if (c->uses_cc) sp(&s, "  uint cc = 0; bool ccz = false, ccs = false;\n");

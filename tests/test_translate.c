@@ -64,6 +64,15 @@ static uint64_t texs2d(int d0, int d1, int a, int b, int slot) {
     return rr(0xd800000000000000ull | 1ull << 53 | 4ull << 50 | (uint64_t)(0x20 + 8 * slot) / 4 << 36 | (uint64_t)d1 << 28 |
               (uint64_t)b << 20, d0, a);
 }
+static uint64_t mov_rz(int d) { return rr(0x5c98078000000000ull | (uint64_t)RZ << 20, d, 0); }
+static uint64_t i2f_neg(int d, int b) {  // d = float(-int(b))
+    return rr(0x5cb8000000000000ull | 1ull << 45 | 1ull << 13 | 2ull << 10 | 2ull << 8 | (uint64_t)b << 20, d, 0);
+}
+// XMAD reg, reg: d = (a.lo|hi * b.lo|hi) (<< 16: psl) + c (cmode 4: cbcc), mrg: the result's high half b's low half
+static uint64_t xmad(int d, int a, int ha, int b, int hb, int c, int psl, int mrg, int cmode) {
+    return rr(0x5b00000000000000ull | (uint64_t)b << 20 | (uint64_t)c << 39 | (uint64_t)hb << 35 | (uint64_t)psl << 36 |
+              (uint64_t)mrg << 37 | (uint64_t)cmode << 50 | (uint64_t)ha << 53, d, a);
+}
 static uint64_t s2r(int d, int sr) { return rr(0xf0c8000000000000ull | (uint64_t)sr << 20, d, 0); }
 static uint64_t lds(int d, int a, int off) { return rr(0xef48000000000000ull | 4ull << 48 | (uint64_t)(off & 0xffffff) << 20, d, a); }
 static uint64_t sts(int s, int a, int off) { return rr(0xef58000000000000ull | 4ull << 48 | (uint64_t)(off & 0xffffff) << 20, s, a); }
@@ -159,6 +168,26 @@ static void ps_branch(Prog *p) {
     p->w[bi] = at(P0, 0, bra(b, els));
 }
 
+// if (v0.x > 0.5) green else red, the else path going to the SSY target by BRA, not SYNC: the join is reached with
+// the SSY entry popped and with it still on the stack (structured all the same: its edges do not depend on the stack)
+static void ps_ssy_unpopped(Prog *p) {
+    emit(p, ipa(4, 0x7c, 0, RZ));
+    emit(p, mufu_rcp(4, 4));
+    emit(p, ipa(5, 0x80, 1, 4));
+    int si = p->n, s = emit(p, 0);
+    emit(p, fsetp_i(P0, GT, 5, 0.5f));
+    int bi = p->n, b = emit(p, 0);
+    emit(p, movf(0, 1.0f)); emit(p, movf(1, 0.0f));
+    int ji = p->n, j = emit(p, 0);  // BRA join
+    int els = emit(p, movf(0, 0.0f)); emit(p, movf(1, 1.0f));
+    emit(p, sync_());
+    int join = emit(p, movf(2, 0.0f)); emit(p, movf(3, 1.0f));
+    emit(p, exit_());
+    p->w[si] = ssy(s, join);
+    p->w[bi] = at(P0, 0, bra(b, els));
+    p->w[ji] = bra(j, join);
+}
+
 // four rounds of r1 += 0.25 (a do-while loop on an integer counter)
 static void ps_loop(Prog *p) {
     emit(p, mov32i(0, 0));
@@ -178,6 +207,49 @@ static void ps_discard(Prog *p) {
     emit(p, ipa(0, 0x80, 1, 4));
     emit(p, fsetp_i(P0, LT, 0, 0.0f));
     emit(p, at(P0, 0, kil()));
+    emit(p, movf(1, 0.0f)); emit(p, movf(2, 0.0f)); emit(p, movf(3, 1.0f));
+    emit(p, exit_());
+}
+
+// discard where v0.x < 0 by a branch around a KIL block (which zeroes 1 / w first), then varying 1 times 1 / w: the
+// discarded path does not reach it, so 1 / w is still the one definition there and the multiply folds (Ryujinx's SSA)
+static void ps_kil_fold(Prog *p) {
+    emit(p, ipa(4, 0x7c, 0, RZ));
+    emit(p, mufu_rcp(4, 4));
+    emit(p, ipa(0, 0x80, 1, 4));
+    emit(p, fsetp_i(P0, LT, 0, 0.0f));
+    int bi = p->n, b = emit(p, 0);
+    emit(p, mov_rz(4));
+    emit(p, kil());
+    int join = emit(p, ipa(0, 0x90, 1, 4));
+    emit(p, ipa(1, 0x94, 1, 4));
+    emit(p, movf(2, 0.0f)); emit(p, movf(3, 1.0f));
+    emit(p, exit_());
+    p->w[bi] = at(P0, 1, bra(b, join));
+}
+
+// r0 * r1 + r2 as the compiler writes a 32-bit multiply, the MRG part over b's register: one multiply of the values the
+// first part read (Ryujinx's XmadOptimizer)
+static void ps_xmad_mul(Prog *p) {
+    emit(p, mov32i(0, 123456789u)); emit(p, mov32i(1, 987654321u)); emit(p, mov32i(2, 5));
+    emit(p, xmad(3, 0, 0, 1, 0, 2, 0, 0, 0));      // t = r0.lo * r1.lo + r2
+    emit(p, xmad(1, 0, 0, 1, 1, RZ, 0, 1, 0));     // u = MRG r0.lo * r1.hi (into r1)
+    emit(p, xmad(0, 0, 1, 1, 1, 3, 1, 0, 4));      // r0 = PSL.CBCC r0.hi * u.hi + t
+    emit(p, movf(1, 0.0f)); emit(p, movf(2, 0.0f)); emit(p, movf(3, 1.0f));
+    emit(p, exit_());
+}
+
+// SR_THREAD_KILL: whether the invocation is a helper (as on entry), as colour
+static void ps_helper(Prog *p) {
+    emit(p, s2r(0, 0x13));
+    emit(p, movf(1, 0.0f)); emit(p, movf(2, 0.0f)); emit(p, movf(3, 1.0f));
+    emit(p, exit_());
+}
+
+// -int(0): the negation is the integer's (+0, never -0)
+static void ps_i2f_neg(Prog *p) {
+    emit(p, mov32i(0, 0));
+    emit(p, i2f_neg(0, 0));
     emit(p, movf(1, 0.0f)); emit(p, movf(2, 0.0f)); emit(p, movf(3, 1.0f));
     emit(p, exit_());
 }
@@ -223,8 +295,13 @@ static const Test tests[] = {
     {"ps_texture", STAGE_FRAGMENT, NVN, 0xf, ".sample(", NULL, NULL, ps_texture, 0},
     {"ps_branch", STAGE_FRAGMENT, NVN, 0xf, "if (", "switch (pc)", NULL, ps_branch, 0},
     {"ps_loop", STAGE_FRAGMENT, NVN, 0xf, "while (", "switch (pc)", NULL, ps_loop, 0},
+    {"ps_ssy_unpopped", STAGE_FRAGMENT, NVN, 0xf, "if (", "switch (pc)", NULL, ps_ssy_unpopped, 0},
     {"ps_discard", STAGE_FRAGMENT, NVN, 0xf, "discard_fragment()", NULL, NULL, ps_discard, 0},
     {"ps_ffma", STAGE_FRAGMENT, NVN, 0xf, "fma(", NULL, NULL, ps_ffma, 0},
+    {"ps_kil_fold", STAGE_FRAGMENT, NVN, 0xf, "as_type<uint>(in.v1[0]);", "gl_FragCoord.w * as_type<float>", NULL, ps_kil_fold, 0},
+    {"ps_i2f_neg", STAGE_FRAGMENT, NVN, 0xf, "float((-int(r0)))", "(-float(", NULL, ps_i2f_neg, 0},
+    {"ps_helper", STAGE_FRAGMENT, NVN, 0xf, "simd_is_helper_thread()", NULL, NULL, ps_helper, 0},
+    {"ps_xmad_mul", STAGE_FRAGMENT, NVN, 0xf, "r0 = ((xs0 * xs1) + xs2);", NULL, NULL, ps_xmad_mul, 0},
     {"cs_shared_global", STAGE_COMPUTE, NVN, 0, "MAXMETAL_GAT(ga, s0)", NULL, NULL, cs_shared_global, 0},
     {"ps_texture_plain", STAGE_FRAGMENT, PLAIN, 0xf, ".sample(", "rscale", NULL, ps_texture, 0},
     {"ps_branch_plain", STAGE_FRAGMENT, PLAIN, 0xf, "switch (pc)", "ltint", NULL, ps_branch, 0},

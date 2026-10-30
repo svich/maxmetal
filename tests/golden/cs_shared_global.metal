@@ -13,7 +13,7 @@ struct maxmetal_sb
     uint _m0[1];
 };
 
-#define MAXMETAL_GAT(ga, k) device uint *gp = (*spvDescriptorSet0.cp_##k)._m0; uint go = uint(ga) - gk_##k.x; const bool gok = go < gk_##k.z;
+#define MAXMETAL_GAT(ga, k) device uint *gp = (*spvDescriptorSet0.cp_##k)._m0; uint go = uint(ga) - gk_##k.x; const bool gok = true;
 #define MAXMETAL_GDECL device uint *gp = nullptr; uint go = 0u;
 #define MAXMETAL_GIN(ga, x) if ((ga) - gb_##x < ulong(gn_##x)) { gp = (*spvDescriptorSet0.cp_##x)._m0; go = uint((ga) - gb_##x); }
 #define MAXMETAL_GOK const bool gok = gp != nullptr;

@@ -73,6 +73,10 @@ static NSString *with_loop_cap(NSString *src) {
     static unsigned cap;
     if (!cap) cap = getenv("MAXMETAL_DIFF_LOOP_CAP") ? (unsigned)atoi(getenv("MAXMETAL_DIFF_LOOP_CAP")) : 4096;
     NSString *brk = [NSString stringWithFormat:@" if (++maxmetal_cap > %uu) { atomic_store_explicit(maxmetal_capped, 1u, memory_order_relaxed); break; }", cap];
+    // MAXMETAL_DIFF_LOOP_CAP_ENTRY=N: also each loop breaks after N iterations from where it is entered (a counter set
+    // before the loop), so the two sides' equivalent loops stop at the same iteration and capped outputs compare
+    static unsigned entry = 1;
+    if (entry == 1) entry = getenv("MAXMETAL_DIFF_LOOP_CAP_ENTRY") ? (unsigned)atoi(getenv("MAXMETAL_DIFF_LOOP_CAP_ENTRY")) : 0;
     NSMutableString *o = [NSMutableString string];
     __block size_t from = 0;
     void (^to)(size_t) = ^(size_t k) { [o appendString:[[NSString alloc] initWithBytes:s + from length:k - from encoding:NSUTF8StringEncoding]]; from = k; };
@@ -95,8 +99,13 @@ static NSString *with_loop_cap(NSString *src) {
             if (!strncmp(s + w, "while (false)", 13)) continue;
         } else continue;
         if (open >= end || s[open] != '{') continue;
+        if (entry) {
+            to(i);
+            [o appendFormat:@"uint maxmetal_cap%d = 0u; ", g_capsites];
+        }
         to(open + 1);
         [o appendString:brk];
+        if (entry) [o appendFormat:@" if (++maxmetal_cap%d > %uu) { atomic_store_explicit(maxmetal_capped, 1u, memory_order_relaxed); break; }", g_capsites, entry];
         g_capsites++;
         i = open;
     }
@@ -405,7 +414,8 @@ static NSString *retype_color(NSString *msl, int n, NSString *want) {
 static double run_time(id<MTLCommandBuffer> cb) { return (cb.GPUEndTime - cb.GPUStartTime) * 1e3; }
 
 static NSString *run_fragment(Side *sd, NSData **out_colors, NSMutableDictionary *writable, double *ms) {
-    int W = 32, H = 32;
+    // timed: MAXMETAL_DIFF_TIME_SIZE x the same (default 32: a 32x32 draw is mostly the render pass's own cost)
+    int W = ms && getenv("MAXMETAL_DIFF_TIME_SIZE") ? atoi(getenv("MAXMETAL_DIFF_TIME_SIZE")) : 32, H = W;
     NSMutableArray *use = [NSMutableArray array]; NSString *why = nil;
     id<MTLBuffer> ab = encode_args(sd, writable, use, &why);
     if (!ab) return why;
@@ -569,7 +579,9 @@ static NSString *run_vertex(Side *sd, NSData **dump, NSMutableDictionary *writab
         [en setVertexBuffer:capb offset:0 atIndex:CAP_INDEX];
         for (NSDictionary *vi in sd->refl[@"vertex_inputs"]) { int loc = [vi[@"location"] intValue]; [en setVertexBuffer:g_res[[NSString stringWithFormat:@"attr:%d", loc]] offset:0 atIndex:16 + loc]; }
         for (id x in use) [en useResource:x usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex];
-        [en drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:nv];
+        // timed: MAXMETAL_DIFF_TIME_INSTANCES instances of the 64 vertices (default 1)
+        [en drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:nv
+             instanceCount:ms && getenv("MAXMETAL_DIFF_TIME_INSTANCES") ? (NSUInteger)atoi(getenv("MAXMETAL_DIFF_TIME_INSTANCES")) : 1];
         [en endEncoding];
     }
     [cb commit]; wait_cb(cb, sd->who);
@@ -693,6 +705,7 @@ int main(int argc, const char **argv) {
                 Cmp c = {0};
                 NSString *er = nil, *el = nil;
                 double tr = 0, tl = 0;
+                NSMutableDictionary *types = [NSMutableDictionary dictionary];  // (vs: the Ryujinx path's vertex input types)
                 if ([g_stage isEqual:@"ps"]) {
                     // outputs the Ryujinx path declares as integers: the maxmetal function retyped as the renderer retypes it
                     for (int n = 0; n < 8; n++) {
@@ -723,9 +736,7 @@ int main(int argc, const char **argv) {
                             pr += lr; pl += ll;
                         }
                     }
-                    if (!er && !el && g_time) { run_fragment(&R, &cr, wr, &tr); run_fragment(&L, &cl, wl, &tl); }
                 } else if ([g_stage isEqual:@"vs"]) {
-                    NSMutableDictionary *types = [NSMutableDictionary dictionary];
                     for (NSDictionary *vi in R.refl[@"vertex_inputs"]) types[vi[@"location"]] = vi[@"msl_type"];
                     NSData *dr = nil, *dl = nil;
                     er = run_vertex(&R, &dr, wr, types, NULL);
@@ -746,7 +757,6 @@ int main(int argc, const char **argv) {
                                 cmp_words(&c, x, y, s == 33 ? 1 : 4, YES, s == 32 ? @"position" : s == 33 ? @"point size" : [NSString stringWithFormat:@"v%d", s]);
                             }
                     }
-                    if (!er && !el && g_time) { run_vertex(&R, &dr, wr, types, &tr); run_vertex(&L, &dl, wl, types, &tl); }
                 } else {
                     er = run_compute(&R, wr, NULL);
                     if (!er) el = run_compute(&L, wl, NULL);
@@ -764,9 +774,19 @@ int main(int argc, const char **argv) {
                         id<MTLBuffer> x = wr[k], y = wl[k];
                         cmp_words(&c, x.contents, y.contents, x.length / 4, YES, k);
                     }
-                // (compute: timed after the comparison, the timed runs change the stored contents)
-                if (!er && !el && g_time && [g_stage isEqual:@"cs"] && (run_compute(&R, wr, &tr) || run_compute(&L, wl, &tl)))
-                    tr = tl = 0;  // (a GPU error: no time)
+                // timed after the comparison: the timed runs change the stored contents. The side timed first pays for
+                // the GPU warming up (twice the time, 2026-10-30): one untimed round, then two, each side's fastest
+                if (!er && !el && g_time) {
+                    for (int round = 0; round < 3; round++) {
+                        NSData *x = nil, *y = nil;
+                        double a = 0, b = 0;
+                        if ([g_stage isEqual:@"ps"]) { run_fragment(&R, &x, wr, &a); run_fragment(&L, &y, wl, &b); }
+                        else if ([g_stage isEqual:@"vs"]) { run_vertex(&R, &x, wr, types, &a); run_vertex(&L, &y, wl, types, &b); }
+                        else if (run_compute(&R, wr, &a) || run_compute(&L, wl, &b)) { tr = tl = 0; break; }  // (a GPU error: no time)
+                        if (round == 1 || (round > 1 && a < tr)) tr = a;
+                        if (round == 1 || (round > 1 && b < tl)) tl = b;
+                    }
+                }
                 if (er || el) {
                     printf(er ? "skip %s ryujinx run: %s\n" : "fail %s maxmetal run: %s\n", argv[i], (er ?: el).UTF8String);
                     // after a GPU error the system ignores this process's later command buffers: exit (3, as wait_cb)
