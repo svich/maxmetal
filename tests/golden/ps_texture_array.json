@@ -1,0 +1,1 @@
+"bindings": [{"msl_name": "fp_t0", "msl_type": "texture2d_array<float>", "arg_id": 0, "kind": "tex", "reg": 0}, {"msl_name": "fp_t0Smplr", "msl_type": "sampler", "arg_id": 1, "kind": "samp_tex", "reg": 0}], "vertex_inputs": [], "drv_reads": {}, "drv_unfillable": [], "deps": {"tex": {"0": "*"}, "img": {}, "attr": {}, "fout": {}}, "compare_slots": []

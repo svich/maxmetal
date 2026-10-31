@@ -60,10 +60,11 @@ static uint64_t ldc(int d, int bank, uint32_t off, int wide) {  // d (d + 1) = c
     return rr(0xef90000000000000ull | (uint64_t)(wide ? 5 : 4) << 48 | (uint64_t)bank << 36 | (uint64_t)(off & 0xffff) << 20, d, RZ);
 }
 // TEXS 2D, 32-bit results: rgba into d0, d0 + 1, d1, d1 + 1; coordinates (a, b); NVN texture slot (handle c2[0x20 + 8 * slot])
-static uint64_t texs2d(int d0, int d1, int a, int b, int slot) {
-    return rr(0xd800000000000000ull | 1ull << 53 | 4ull << 50 | (uint64_t)(0x20 + 8 * slot) / 4 << 36 | (uint64_t)d1 << 28 |
-              (uint64_t)b << 20, d0, a);
+static uint64_t texs(int d0, int d1, int a, int b, int slot, int info) {  // info: the texture_info (1: 2D, 7: 2D array)
+    return rr(0xd800000000000000ull | (uint64_t)info << 53 | 4ull << 50 | (uint64_t)(0x20 + 8 * slot) / 4 << 36 |
+              (uint64_t)d1 << 28 | (uint64_t)b << 20, d0, a);
 }
+static uint64_t texs2d(int d0, int d1, int a, int b, int slot) { return texs(d0, d1, a, b, slot, 1); }
 static uint64_t mov_rz(int d) { return rr(0x5c98078000000000ull | (uint64_t)RZ << 20, d, 0); }
 static uint64_t i2f_neg(int d, int b) {  // d = float(-int(b))
     return rr(0x5cb8000000000000ull | 1ull << 45 | 1ull << 13 | 2ull << 10 | 2ull << 8 | (uint64_t)b << 20, d, 0);
@@ -120,6 +121,7 @@ typedef struct {
     const char *fail;         // the translation fails with this error
     void (*make)(Prog *);
     uint8_t features;         // ShaderKey.features
+    uint8_t nvn;              // NVN key extras: 1 texture slot 0 a 2D array, 2 hw_layer_clamp
 } Test;
 #define LAS (MAXMETAL_FEAT_RSCALE | MAXMETAL_FEAT_TINT | MAXMETAL_FEAT_LAS)  // Link's Awakening's renderer
 
@@ -147,6 +149,18 @@ static void ps_texture(Prog *p) {
     emit(p, ipa(7, 0x88, 1, 4));
     emit(p, texs2d(0, 2, 5, 6, 0));
     for (int i = 0; i < 4; i++) emit(p, fmul(i, i, 7));
+    emit(p, exit_());
+}
+
+// varying 0 .xy (perspective) as coordinates into 2D array texture slot 0, layer 3 (TEXS 2D array: layer in a, u in
+// a + 1, v in b)
+static void ps_texture_array(Prog *p) {
+    emit(p, ipa(4, 0x7c, 0, RZ));
+    emit(p, mufu_rcp(4, 4));
+    emit(p, ipa(6, 0x80, 1, 4));
+    emit(p, ipa(7, 0x84, 1, 4));
+    emit(p, mov32i(5, 3));
+    emit(p, texs(0, 2, 5, 7, 0, 7));
     emit(p, exit_());
 }
 
@@ -293,6 +307,8 @@ static const Test tests[] = {
     {"vs_passthrough", STAGE_VERTEX, NVN, 0, "[[position", NULL, NULL, vs_passthrough, 0},
     {"ps_color", STAGE_FRAGMENT, NVN, 0xf, "[[color(0)]]", NULL, NULL, ps_color, 0},
     {"ps_texture", STAGE_FRAGMENT, NVN, 0xf, ".sample(", NULL, NULL, ps_texture, 0},
+    {"ps_texture_array", STAGE_FRAGMENT, NVN, 0xf, "get_array_size() - 1u", NULL, NULL, ps_texture_array, 0, 1},
+    {"ps_texture_array_hw_clamp", STAGE_FRAGMENT, NVN, 0xf, ".sample(", "get_array_size", NULL, ps_texture_array, 0, 3},
     {"ps_branch", STAGE_FRAGMENT, NVN, 0xf, "if (", "switch (pc)", NULL, ps_branch, 0},
     {"ps_loop", STAGE_FRAGMENT, NVN, 0xf, "while (", "switch (pc)", NULL, ps_loop, 0},
     {"ps_ssy_unpopped", STAGE_FRAGMENT, NVN, 0xf, "if (", "switch (pc)", NULL, ps_ssy_unpopped, 0},
@@ -360,7 +376,8 @@ static int run(const Test *t, const char *golden, const char *out, int update) {
     NvnKey nk;
     memset(&nk, 0, sizeof nk);
     memset(nk.tex_type, -1, sizeof nk.tex_type);
-    nk.tex_type[0] = TEXTYPE_2D;
+    nk.tex_type[0] = t->nvn & 1 ? TEXTYPE_2D_ARRAY : TEXTYPE_2D;
+    nk.hw_layer_clamp = t->nvn & 2;
     nk.local[0] = 64; nk.local[1] = 1; nk.local[2] = 1;
     ShaderKey key;
     memset(&key, 0, sizeof key);

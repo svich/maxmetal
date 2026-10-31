@@ -5,9 +5,11 @@
 // Inputs are random (seeded by variant): constant buffers floats in [0, 1), textures [0, 1), vertex attributes the
 // Ryujinx path types as integers small integers. Reported per variant: exact, close (float within 1e-4 relative),
 // different, capped (a side hit the test-only loop cap: with_loop_cap), or skipped (what the harness does not bind).
-// MAXMETAL_DIFF_COMPILE_ONLY=1: compile both sides (loop cap injected) and run nothing.
+// MAXMETAL_DIFF_COMPILE_ONLY=1: compile both sides (loop cap injected) and run nothing (with MAXMETAL_DIFF_ARCHIVE: the
+// pipelines also built and saved, not run).
 // Usage: maxmetal-diff [--time N] <ryujinx dir> <maxmetal dir> <variant>...   (variant: the name before _b.metal)
-// --time N: also draw / dispatch each function N times and report the GPU time of both (ms).
+// --time N: also draw / dispatch each function N times and report the GPU time of both (ms). MAXMETAL_DIFF_TIME_PAIRED /
+// _ROUNDS / _ONEPASS / _NODUMP / _LOG choose how (README); MAXMETAL_DIFF_ARCHIVE=<dir> saves the pipelines' GPU binaries.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <math.h>
@@ -18,9 +20,10 @@ static id<MTLDevice> dev;
 static id<MTLCommandQueue> queue;
 static int g_time;
 static const char *g_variant;   // the variant being compared (wait_cb's line)
+static BOOL g_build_only;   // run_*: build (and archive) the pipeline, then return before running it
 
-// A shader can run on the GPU without end and without a hang error coming back (a cs on 2026-10-28: waitUntilCompleted
-// blocked 15 min). Each run gets GPU_TIMEOUT seconds (default 20), then its timeout is the variant's line and the process
+// A shader can run on the GPU without end and without a hang error coming back (waitUntilCompleted has
+// blocked 15 min on a cs). Each run gets GPU_TIMEOUT seconds (default 20), then its timeout is the variant's line and the process
 // exits (3), so a batch driver can go on with the rest. who: "ryujinx" (a skip), "maxmetal" (a fail) or "setup".
 static void wait_cb(id<MTLCommandBuffer> cb, const char *who) {
     static double limit;
@@ -51,7 +54,7 @@ typedef struct { NSString *msl; NSDictionary *refl; id<MTLFunction> fn; NSString
 
 // ---- test-only loop cap. Random inputs can make a shader loop without end (loop counts and list walks read from the
 // data): the GPU runs until the watchdog resets it, a reset every app sees (screen glitches, a lost external display,
-// on 2026-10-29 a frozen Mac). Each loop of main0 breaks once main0's loops have run MAXMETAL_DIFF_LOOP_CAP iterations in all
+// a frozen Mac). Each loop of main0 breaks once main0's loops have run MAXMETAL_DIFF_LOOP_CAP iterations in all
 // (default 4096) and sets a flag the run reads back: a variant that hits it on either side is "capped", its comparison
 // says nothing about the translation.
 #define CAP_INDEX 15     // the flag's buffer index in every stage (vertex attributes from 16, the vertex dump at 29)
@@ -426,11 +429,30 @@ static NSString *retype_color(NSString *msl, int n, NSString *want) {
     return s;
 }
 
+static int cmp_double(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return x < y ? -1 : x > y; }
 static double run_time(id<MTLCommandBuffer> cb) { return (cb.GPUEndTime - cb.GPUStartTime) * 1e3; }
 
-static NSString *run_fragment(Side *sd, NSData **out_colors, NSMutableDictionary *writable, double *ms) {
-    // timed: MAXMETAL_DIFF_TIME_SIZE x the same (default 32: a 32x32 draw is mostly the render pass's own cost)
-    int W = ms && getenv("MAXMETAL_DIFF_TIME_SIZE") ? atoi(getenv("MAXMETAL_DIFF_TIME_SIZE")) : 32, H = W;
+// MAXMETAL_DIFF_ARCHIVE=<dir>: also each pipeline's GPU binary (a binary archive), in <dir>/<variant>.<side>.bin
+static void archive_pipeline(id desc, Side *sd) {
+    if (!getenv("MAXMETAL_DIFF_ARCHIVE")) return;
+    NSError *e = nil;
+    id<MTLBinaryArchive> ar = [dev newBinaryArchiveWithDescriptor:[MTLBinaryArchiveDescriptor new] error:&e];
+    BOOL ok = [desc isKindOfClass:[MTLComputePipelineDescriptor class]] ? [ar addComputePipelineFunctionsWithDescriptor:desc error:&e]
+                                                                        : [ar addRenderPipelineFunctionsWithDescriptor:desc error:&e];
+    if (ok) [ar serializeToURL:[NSURL fileURLWithPath:[NSString stringWithFormat:@"%s/%s.%s.bin", getenv("MAXMETAL_DIFF_ARCHIVE"), g_variant ?: "x", sd->who]] error:&e];
+}
+
+typedef struct {
+    int W, H;
+    id<MTLBuffer> ab, capb, grid;
+    NSMutableArray *use, *targets;
+    id<MTLTexture> dt;
+    id<MTLRenderPipelineState> ps;
+    id<MTLDepthStencilState> ds;
+} FragRun;
+
+static NSString *frag_setup(Side *sd, NSMutableDictionary *writable, int W, FragRun *f) {
+    int H = W;
     NSMutableArray *use = [NSMutableArray array]; NSString *why = nil;
     id<MTLBuffer> ab = encode_args(sd, writable, use, &why);
     if (!ab) return why;
@@ -438,10 +460,10 @@ static NSString *run_fragment(Side *sd, NSData **out_colors, NSMutableDictionary
     pd.vertexFunction = grid_vs(); pd.fragmentFunction = sd->fn;
     NSMutableArray *targets = [NSMutableArray array];
     for (int n = 0; n < 8; n++) {
-        BOOL present; MTLPixelFormat f = out_format(sd->msl, n, &present);
+        BOOL present; MTLPixelFormat fm = out_format(sd->msl, n, &present);
         if (!present) { [targets addObject:[NSNull null]]; continue; }
-        pd.colorAttachments[n].pixelFormat = f;
-        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:f width:W height:H mipmapped:NO];
+        pd.colorAttachments[n].pixelFormat = fm;
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fm width:W height:H mipmapped:NO];
         td.usage = MTLTextureUsageRenderTarget; td.storageMode = MTLStorageModePrivate;
         [targets addObject:[dev newTextureWithDescriptor:td]];
     }
@@ -456,31 +478,87 @@ static NSString *run_fragment(Side *sd, NSData **out_colors, NSMutableDictionary
     NSError *e = nil;
     id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd error:&e];
     if (!ps) return [NSString stringWithFormat:@"pipeline: %@", e.localizedDescription];
+    archive_pipeline(pd, sd);
     MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
     dd.depthCompareFunction = MTLCompareFunctionAlways; dd.depthWriteEnabled = depth;
-    id<MTLDepthStencilState> ds = [dev newDepthStencilStateWithDescriptor:dd];
     id<MTLBuffer> k = g_res[@"grid"];
-    if (!k) { NSMutableData *d = [NSMutableData dataWithLength:96 * 16]; float *f = d.mutableBytes; for (int i = 0; i < 96 * 4; i++) f[i] = rndf() * 2.0f - 0.5f; g_res[@"grid"] = k = buf_with(d); }
-    int reps = ms ? g_time : 1;
-    id<MTLBuffer> capb = cap_buffer();
-    id<MTLCommandBuffer> cb = [queue commandBuffer];
-    for (int r = 0; r < reps; r++) {
-        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        for (int n = 0; n < 8; n++) {
-            if (targets[n] == [NSNull null]) continue;
-            rp.colorAttachments[n].texture = targets[n]; rp.colorAttachments[n].loadAction = MTLLoadActionClear;
-            rp.colorAttachments[n].storeAction = MTLStoreActionStore; rp.colorAttachments[n].clearColor = MTLClearColorMake(0, 0, 0, 0);
-        }
-        if (dt) { rp.depthAttachment.texture = dt; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.storeAction = MTLStoreActionStore; rp.depthAttachment.clearDepth = 0.25; }
-        id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
-        [en setRenderPipelineState:ps]; [en setDepthStencilState:ds];
-        [en setVertexBuffer:k offset:0 atIndex:1];
-        [en setFragmentBuffer:ab offset:0 atIndex:0];
-        [en setFragmentBuffer:capb offset:0 atIndex:CAP_INDEX];
-        for (id r in use) [en useResource:r usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageFragment];
-        [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
-        [en endEncoding];
+    if (!k) { NSMutableData *d = [NSMutableData dataWithLength:96 * 16]; float *fl = d.mutableBytes; for (int i = 0; i < 96 * 4; i++) fl[i] = rndf() * 2.0f - 0.5f; g_res[@"grid"] = k = buf_with(d); }
+    *f = (FragRun){W, H, ab, cap_buffer(), k, use, targets, dt, ps, [dev newDepthStencilStateWithDescriptor:dd]};
+    return nil;
+}
+
+// One render pass of `draws` full-target draws.
+static void frag_encode(id<MTLCommandBuffer> cb, FragRun *f, int draws) {
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    for (int n = 0; n < 8; n++) {
+        if (f->targets[n] == [NSNull null]) continue;
+        rp.colorAttachments[n].texture = f->targets[n]; rp.colorAttachments[n].loadAction = MTLLoadActionClear;
+        rp.colorAttachments[n].storeAction = MTLStoreActionStore; rp.colorAttachments[n].clearColor = MTLClearColorMake(0, 0, 0, 0);
     }
+    if (f->dt) { rp.depthAttachment.texture = f->dt; rp.depthAttachment.loadAction = MTLLoadActionClear; rp.depthAttachment.storeAction = MTLStoreActionStore; rp.depthAttachment.clearDepth = 0.25; }
+    id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+    [en setRenderPipelineState:f->ps]; [en setDepthStencilState:f->ds];
+    [en setVertexBuffer:f->grid offset:0 atIndex:1];
+    [en setFragmentBuffer:f->ab offset:0 atIndex:0];
+    [en setFragmentBuffer:f->capb offset:0 atIndex:CAP_INDEX];
+    for (id r in f->use) [en useResource:r usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageFragment];
+    for (int d = 0; d < draws; d++) [en drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+    [en endEncoding];
+}
+
+typedef void (^Encode)(id<MTLCommandBuffer> cb, int draws);   // one render pass of a side, `draws` draws
+
+// MAXMETAL_DIFF_TIME_PAIRED=N: N render passes of each side, in turn (ab ba ab ...), each its own command buffer of draws
+// in one pass: neighbouring passes see the same GPU clock.
+static NSString *time_pair(const char *who, Encode ea, Encode eb, int pairs, double *tr, double *tl) {
+    pairs = MIN(MAX(pairs, 2), 256);
+    // draws per pass: enough for about 4 ms (at least g_time), after about 100 ms of warming up the GPU clock
+    int draws = g_time;
+    for (double spent = 0; spent < 100; ) {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        ea(cb, draws); eb(cb, draws);
+        [cb commit]; wait_cb(cb, who);
+        if (cb.error) return [NSString stringWithFormat:@"gpu: %@", cb.error.localizedDescription];
+        double t = run_time(cb); spent += t;
+        draws = MIN(MAX((int)(draws * 8.0 / MAX(t, 0.01)), g_time), 4000);
+    }
+    double ta[256], tb[256];
+    for (int i = 0; i < 2 * pairs; i++) {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        BOOL isb = ((i >> 1) + i) % 2;
+        (isb ? eb : ea)(cb, draws);
+        [cb commit]; wait_cb(cb, who);   // (in flight together, command buffers overlap and their times add up wrong)
+        if (cb.error) return [NSString stringWithFormat:@"gpu: %@", cb.error.localizedDescription];
+        (isb ? tb : ta)[i / 2] = run_time(cb) / draws;
+    }
+    if (getenv("MAXMETAL_DIFF_TIME_LOG")) { fprintf(stderr, "draws %d:", draws); for (int i = 0; i < pairs; i++) fprintf(stderr, " %.4f/%.4f", ta[i], tb[i]); fprintf(stderr, "\n"); }
+    // each side's lower quartile: a pass runs either at full speed or, while something else holds the GPU or memory, up
+    // to 1.5x slower (the Mac's own display work)
+    qsort(ta, pairs, sizeof(double), cmp_double); qsort(tb, pairs, sizeof(double), cmp_double);
+    *tr = ta[pairs / 4]; *tl = tb[pairs / 4];
+    return nil;
+}
+
+static NSString *time_fragment_pair(Side *R, Side *L, NSMutableDictionary *wr, NSMutableDictionary *wl, int pairs, double *tr, double *tl) {
+    int W = getenv("MAXMETAL_DIFF_TIME_SIZE") ? atoi(getenv("MAXMETAL_DIFF_TIME_SIZE")) : 32;
+    FragRun a, b; NSString *why;
+    if ((why = frag_setup(R, wr, W, &a)) || (why = frag_setup(L, wl, W, &b))) return why;
+    FragRun *pa = &a, *pb = &b;
+    return time_pair(R->who, ^(id<MTLCommandBuffer> cb, int n) { frag_encode(cb, pa, n); }, ^(id<MTLCommandBuffer> cb, int n) { frag_encode(cb, pb, n); }, pairs, tr, tl);
+}
+
+static NSString *run_fragment(Side *sd, NSData **out_colors, NSMutableDictionary *writable, double *ms) {
+    // timed: MAXMETAL_DIFF_TIME_SIZE x the same (default 32: a 32x32 draw is mostly the render pass's own cost)
+    int W = ms && getenv("MAXMETAL_DIFF_TIME_SIZE") ? atoi(getenv("MAXMETAL_DIFF_TIME_SIZE")) : 32, H = W;
+    FragRun f; NSString *why = frag_setup(sd, writable, W, &f);
+    if (why || g_build_only) return why;
+    NSMutableArray *targets = f.targets; id<MTLTexture> dt = f.dt; id<MTLBuffer> capb = f.capb;
+    int reps = ms ? g_time : 1;
+    // MAXMETAL_DIFF_TIME_ONEPASS=1: the timed draws all in one render pass (the targets stay in tile memory: the time is
+    // the shader's, not the clears' and stores')
+    int onepass = ms && getenv("MAXMETAL_DIFF_TIME_ONEPASS") && atoi(getenv("MAXMETAL_DIFF_TIME_ONEPASS"));
+    id<MTLCommandBuffer> cb = [queue commandBuffer];
+    for (int r = 0; r < (onepass ? 1 : reps); r++) frag_encode(cb, &f, onepass ? reps : 1);
     NSMutableArray *reads = [NSMutableArray array];
     id<MTLBlitCommandEncoder> bl = [cb blitCommandEncoder];
     for (int n = 0; n < 9; n++) {
@@ -537,21 +615,54 @@ static NSString *with_vertex_dump(NSString *src, NSString **err) {
     return [src stringByReplacingOccurrencesOfString:@"return out;" withString:[NSString stringWithFormat:@"{ %@return out; }", stores]];
 }
 
-static NSString *run_vertex(Side *sd, NSData **dump, NSMutableDictionary *writable, NSDictionary *ryu_types, double *ms) {
+// A fragment function summing every user output of the vertex function in msl (so none of them is dead).
+static id<MTLFunction> sum_fs(NSString *msl, NSString **err) {
+    NSRegularExpression *st = [NSRegularExpression regularExpressionWithPattern:@"struct main0_out\\s*\\{(.*?)\\};" options:NSRegularExpressionDotMatchesLineSeparators error:nil];
+    NSTextCheckingResult *m = [st firstMatchInString:msl options:0 range:NSMakeRange(0, msl.length)];
+    if (!m) { *err = @"no main0_out"; return nil; }
+    NSString *body = [msl substringWithRange:[m rangeAtIndex:1]];
+    NSMutableString *in = [NSMutableString string], *sum = [NSMutableString string];
+    NSRegularExpression *fld = [NSRegularExpression regularExpressionWithPattern:@"(\\w+)\\s+(\\w+)\\s*\\[\\[user\\(locn(\\d+)\\)\\]\\]" options:0 error:nil];
+    for (NSTextCheckingResult *f in [fld matchesInString:body options:0 range:NSMakeRange(0, body.length)]) {
+        NSString *type = [body substringWithRange:[f rangeAtIndex:1]], *name = [body substringWithRange:[f rangeAtIndex:2]];
+        if (![type isEqual:@"float4"]) { *err = [NSString stringWithFormat:@"output type %@", type]; return nil; }
+        [in appendFormat:@"    float4 %@ [[user(locn%@)]];\n", name, [body substringWithRange:[f rangeAtIndex:3]]];
+        [sum appendFormat:@"    s += i.%@;\n", name];
+    }
+    NSString *src = [NSString stringWithFormat:@"#include <metal_stdlib>\nusing namespace metal;\nstruct fin {\n%@};\nfragment float4 sumfs(fin i [[stage_in]]) {\n    float4 s = 0;\n%@    return s;\n}\n", in, sum];
+    if (!in.length) src = @"#include <metal_stdlib>\nusing namespace metal;\nfragment float4 sumfs() { return float4(0); }\n";
+    NSError *e = nil;
+    id<MTLFunction> fs = [[dev newLibraryWithSource:src options:nil error:&e] newFunctionWithName:@"sumfs"];
+    if (!fs) *err = [NSString stringWithFormat:@"sum fs: %@", e.localizedDescription];
+    return fs;
+}
+
+typedef struct {
+    id<MTLRenderPipelineState> ps;
+    id<MTLBuffer> ab, db, capb;
+    NSMutableArray *use, *attrs;   // attrs: [buffer, index]
+    id<MTLTexture> rt;
+    NSUInteger instances;
+} VertRun;
+
+// nodump (timed only): the function as it is, its outputs read by a fragment function that sums them. (The dump's stores,
+// 34 per vertex into the same 64 slots from every instance, can be most of the time.)
+static NSString *vert_setup(Side *sd, NSMutableDictionary *writable, NSDictionary *ryu_types, BOOL nodump, NSUInteger instances, VertRun *v) {
     NSString *err = nil;
-    NSString *src = with_vertex_dump(sd->msl, &err);
+    NSString *src = nodump ? sd->msl : with_vertex_dump(sd->msl, &err);
     if (!src) return err;
-    id<MTLFunction> fn = compile(src, &err);
+    id<MTLFunction> fn = nodump ? sd->fn : compile(src, &err);
     if (!fn) return [NSString stringWithFormat:@"dump variant: %@", err];
     Side s2 = *sd; s2.fn = fn;
-    NSMutableArray *use = [NSMutableArray array]; NSString *why = nil;
+    NSMutableArray *use = [NSMutableArray array], *attrs = [NSMutableArray array]; NSString *why = nil;
     id<MTLBuffer> ab = encode_args(&s2, writable, use, &why);
     if (!ab) return why;
     MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
     pd.vertexFunction = fn;
     static id<MTLFunction> nullfs;
     if (!nullfs) nullfs = [[dev newLibraryWithSource:@"#include <metal_stdlib>\nusing namespace metal;\nfragment float4 nullfs() { return float4(0); }\n" options:nil error:nil] newFunctionWithName:@"nullfs"];
-    pd.fragmentFunction = nullfs;
+    pd.fragmentFunction = nodump ? sum_fs(sd->msl, &err) : nullfs;
+    if (!pd.fragmentFunction) return err;
     pd.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
     MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
     int nv = 64;
@@ -571,40 +682,60 @@ static NSString *run_vertex(Side *sd, NSData **dump, NSMutableDictionary *writab
             for (int i = 0; i < nv * 4; i++) { if (ints) w[i] = rnd() & 15; else { float f = rndf(); memcpy(&w[i], &f, 4); } }
             g_res[key] = buf_with(d);
         }
+        [attrs addObject:@[g_res[key], @(16 + loc)]];
     }
     pd.vertexDescriptor = vd;
     NSError *e = nil;
     id<MTLRenderPipelineState> ps = [dev newRenderPipelineStateWithDescriptor:pd error:&e];
     if (!ps) return [NSString stringWithFormat:@"pipeline: %@", e.localizedDescription];
+    archive_pipeline(pd, sd);
+    if (g_build_only) return nil;
     id<MTLBuffer> db = [dev newBufferWithLength:nv * 34 * 16 options:MTLResourceStorageModeShared];
     memset(db.contents, 0, db.length);
     MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:4 height:4 mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget; td.storageMode = MTLStorageModePrivate;
-    id<MTLTexture> rt = [dev newTextureWithDescriptor:td];
+    *v = (VertRun){ps, ab, db, cap_buffer(), use, attrs, [dev newTextureWithDescriptor:td], instances};
+    return nil;
+}
+
+// One render pass of `draws` draws, each the instances of the 64 vertices.
+static void vert_encode(id<MTLCommandBuffer> cb, VertRun *v, int draws) {
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = v->rt; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionDontCare;
+    id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
+    [en setRenderPipelineState:v->ps];
+    [en setVertexBuffer:v->ab offset:0 atIndex:0];
+    [en setVertexBuffer:v->db offset:0 atIndex:29];
+    [en setVertexBuffer:v->capb offset:0 atIndex:CAP_INDEX];
+    for (NSArray *a in v->attrs) [en setVertexBuffer:a[0] offset:0 atIndex:[a[1] unsignedIntegerValue]];
+    for (id x in v->use) [en useResource:x usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex];
+    for (int d = 0; d < draws; d++) [en drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:64 instanceCount:v->instances];
+    [en endEncoding];
+}
+
+// timed: MAXMETAL_DIFF_TIME_INSTANCES instances of the 64 vertices (default 1)
+static NSUInteger time_instances(void) { return getenv("MAXMETAL_DIFF_TIME_INSTANCES") ? (NSUInteger)atoi(getenv("MAXMETAL_DIFF_TIME_INSTANCES")) : 1; }
+static BOOL time_nodump(void) { return getenv("MAXMETAL_DIFF_TIME_NODUMP") && atoi(getenv("MAXMETAL_DIFF_TIME_NODUMP")); }
+
+static NSString *run_vertex(Side *sd, NSData **dump, NSMutableDictionary *writable, NSDictionary *ryu_types, double *ms) {
+    VertRun v; NSString *why = vert_setup(sd, writable, ryu_types, ms && time_nodump(), ms ? time_instances() : 1, &v);
+    if (why || g_build_only) return why;
     int reps = ms ? g_time : 1;
-    id<MTLBuffer> capb = cap_buffer();
     id<MTLCommandBuffer> cb = [queue commandBuffer];
-    for (int r = 0; r < reps; r++) {
-        MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
-        rp.colorAttachments[0].texture = rt; rp.colorAttachments[0].loadAction = MTLLoadActionDontCare; rp.colorAttachments[0].storeAction = MTLStoreActionDontCare;
-        id<MTLRenderCommandEncoder> en = [cb renderCommandEncoderWithDescriptor:rp];
-        [en setRenderPipelineState:ps];
-        [en setVertexBuffer:ab offset:0 atIndex:0];
-        [en setVertexBuffer:db offset:0 atIndex:29];
-        [en setVertexBuffer:capb offset:0 atIndex:CAP_INDEX];
-        for (NSDictionary *vi in sd->refl[@"vertex_inputs"]) { int loc = [vi[@"location"] intValue]; [en setVertexBuffer:g_res[[NSString stringWithFormat:@"attr:%d", loc]] offset:0 atIndex:16 + loc]; }
-        for (id x in use) [en useResource:x usage:MTLResourceUsageRead | MTLResourceUsageWrite stages:MTLRenderStageVertex];
-        // timed: MAXMETAL_DIFF_TIME_INSTANCES instances of the 64 vertices (default 1)
-        [en drawPrimitives:MTLPrimitiveTypePoint vertexStart:0 vertexCount:nv
-             instanceCount:ms && getenv("MAXMETAL_DIFF_TIME_INSTANCES") ? (NSUInteger)atoi(getenv("MAXMETAL_DIFF_TIME_INSTANCES")) : 1];
-        [en endEncoding];
-    }
+    for (int r = 0; r < reps; r++) vert_encode(cb, &v, 1);
     [cb commit]; wait_cb(cb, sd->who);
     if (cb.error) return [NSString stringWithFormat:@"gpu: %@", cb.error.localizedDescription];
     if (ms) *ms = run_time(cb) / reps;
-    else cap_check(sd, capb);
-    *dump = [NSData dataWithBytes:db.contents length:db.length];
+    else cap_check(sd, v.capb);
+    *dump = [NSData dataWithBytes:v.db.contents length:v.db.length];
     return nil;
+}
+
+static NSString *time_vertex_pair(Side *R, Side *L, NSMutableDictionary *wr, NSMutableDictionary *wl, NSDictionary *ryu_types, int pairs, double *tr, double *tl) {
+    VertRun a, b; NSString *why;
+    if ((why = vert_setup(R, wr, ryu_types, time_nodump(), time_instances(), &a)) || (why = vert_setup(L, wl, ryu_types, time_nodump(), time_instances(), &b))) return why;
+    VertRun *pa = &a, *pb = &b;
+    return time_pair(R->who, ^(id<MTLCommandBuffer> cb, int n) { vert_encode(cb, pa, n); }, ^(id<MTLCommandBuffer> cb, int n) { vert_encode(cb, pb, n); }, pairs, tr, tl);
 }
 
 static NSString *run_compute(Side *sd, NSMutableDictionary *writable, double *ms) {
@@ -613,7 +744,9 @@ static NSString *run_compute(Side *sd, NSMutableDictionary *writable, double *ms
     if (!ab) return why;
     NSError *e = nil;
     id<MTLComputePipelineState> ps = [dev newComputePipelineStateWithFunction:sd->fn error:&e];
+    if (getenv("MAXMETAL_DIFF_ARCHIVE")) { MTLComputePipelineDescriptor *cd = [MTLComputePipelineDescriptor new]; cd.computeFunction = sd->fn; archive_pipeline(cd, sd); }
     if (!ps) return [NSString stringWithFormat:@"pipeline: %@", e.localizedDescription];
+    if (g_build_only) return nil;
     NSArray *tg = sd->refl[@"threadgroup_size"];
     MTLSize local = MTLSizeMake([tg[0] unsignedIntegerValue], [tg[1] unsignedIntegerValue], [tg[2] unsignedIntegerValue]);
     id<MTLBuffer> capb = cap_buffer();
@@ -705,15 +838,29 @@ int main(int argc, const char **argv) {
                 if (!load_side(&R, ryu, variant)) { printf("skip %s ryujinx: %s\n", argv[i], [[R.err stringByReplacingOccurrencesOfString:@"\n" withString:@" "] substringToIndex:MIN(R.err.length, 160u)].UTF8String); continue; }
                 int loops_r = g_capsites;
                 if (!load_side(&L, mm, variant)) { printf("fail %s maxmetal compile: %s\n", argv[i], [[L.err stringByReplacingOccurrencesOfString:@"\n" withString:@" "] substringToIndex:MIN(L.err.length, 200u)].UTF8String); continue; }
-                if (getenv("MAXMETAL_DIFF_COMPILE_ONLY")) {   // (both sides compiled, loop cap and all; nothing runs on the GPU)
-                    printf("compiled %s loops_ryujinx=%d loops_maxmetal=%d\n", argv[i], loops_r, g_capsites);
-                    fflush(stdout);
-                    continue;
-                }
+                int loops_l = g_capsites;
                 // the stage the program is (the SPH's; a real game's "ps" request can be a vertex program), not the request's label
                 NSString *kind = R.refl[@"msl_entry_kind"];
                 g_stage = [kind isEqual:@"vertex"] ? @"vs" : [kind isEqual:@"fragment"] ? @"ps" : [kind isEqual:@"kernel"] ? @"cs" : R.refl[@"stage"];
                 NSMutableDictionary *types = [NSMutableDictionary dictionary];  // (vs: the Ryujinx path's vertex input types)
+                if (getenv("MAXMETAL_DIFF_COMPILE_ONLY")) {   // (both sides compiled, loop cap and all; nothing runs on the GPU)
+                    NSString *why = nil;
+                    if (getenv("MAXMETAL_DIFF_ARCHIVE")) {   // (the pipelines built and archived as for a run, then not run)
+                        for (NSDictionary *vi in R.refl[@"vertex_inputs"]) types[vi[@"location"]] = vi[@"msl_type"];
+                        g_res = [NSMutableDictionary dictionary]; g_init = [NSMutableDictionary dictionary];
+                        seed(argv[i]);
+                        g_build_only = YES;
+                        for (Side *s = &R; s && !why; s = s == &R ? &L : NULL)
+                            why = [g_stage isEqual:@"ps"] ? run_fragment(s, NULL, [NSMutableDictionary dictionary], NULL)
+                                : [g_stage isEqual:@"vs"] ? run_vertex(s, NULL, [NSMutableDictionary dictionary], types, NULL)
+                                : run_compute(s, [NSMutableDictionary dictionary], NULL);
+                        g_build_only = NO;
+                    }
+                    if (why) printf("fail %s build: %s\n", argv[i], why.UTF8String);
+                    else printf("compiled %s loops_ryujinx=%d loops_maxmetal=%d\n", argv[i], loops_r, loops_l);
+                    fflush(stdout);
+                    continue;
+                }
                 NSString *el0 = nil;
                 if ([g_stage isEqual:@"ps"])
                     // outputs the Ryujinx path declares as integers: the maxmetal function retyped as the renderer retypes it
@@ -728,7 +875,7 @@ int main(int argc, const char **argv) {
                 else if ([g_stage isEqual:@"vs"])
                     for (NSDictionary *vi in R.refl[@"vertex_inputs"]) types[vi[@"location"]] = vi[@"msl_type"];
                 // a run that hits the loop cap and differs runs again on integer inputs (its loops then end: all five
-                // capped of a game's 31307 variants matched, 2026-10-30), unless MAXMETAL_DIFF_INTS already chose them
+                // capped of a game's 31307 variants matched), unless MAXMETAL_DIFF_INTS already chose them
                 g_ints = getenv("MAXMETAL_DIFF_INTS") ? (uint32_t)atoi(getenv("MAXMETAL_DIFF_INTS")) : 0;
                 for (BOOL rerun = NO;; rerun = YES) {
                     g_capped = 0;
@@ -798,16 +945,39 @@ int main(int argc, const char **argv) {
                         }
                     if (!er && !el && g_capped && (c.diff || c.close) && !g_ints) { g_ints = 16; continue; }
                     // timed after the comparison: the timed runs change the stored contents. The side timed first pays for
-                    // the GPU warming up (twice the time, 2026-10-30): one untimed round, then two, each side's fastest
-                    if (!er && !el && g_time) {
-                        for (int round = 0; round < 3; round++) {
+                    // the GPU warming up (twice the time): one untimed round, then two, each side's fastest
+                    // MAXMETAL_DIFF_TIME_ROUNDS=N (> 3): N rounds, the sides in turn first, each side's median after the first
+                    const char *pe = getenv("MAXMETAL_DIFF_TIME_PAIRED");
+                    if (!er && !el && g_time && pe && atoi(pe) && ([g_stage isEqual:@"ps"] || [g_stage isEqual:@"vs"])) {
+                        NSString *why = [g_stage isEqual:@"ps"] ? time_fragment_pair(&R, &L, wr, wl, atoi(pe), &tr, &tl)
+                                                                : time_vertex_pair(&R, &L, wr, wl, types, atoi(pe), &tr, &tl);
+                        if (why) { tr = tl = 0; if ([why hasPrefix:@"gpu:"]) el = why; }
+                    } else if (!er && !el && g_time) {
+                        int rounds = getenv("MAXMETAL_DIFF_TIME_ROUNDS") ? MAX(3, atoi(getenv("MAXMETAL_DIFF_TIME_ROUNDS"))) : 3;
+                        double ta[256], tb[256]; rounds = MIN(rounds, 256); BOOL timed = YES;
+                        for (int round = 0; round < rounds; round++) {
                             NSData *x = nil, *y = nil;
                             double a = 0, b = 0;
-                            if ([g_stage isEqual:@"ps"]) { run_fragment(&R, &x, wr, &a); run_fragment(&L, &y, wl, &b); }
-                            else if ([g_stage isEqual:@"vs"]) { run_vertex(&R, &x, wr, types, &a); run_vertex(&L, &y, wl, types, &b); }
-                            else if (run_compute(&R, wr, &a) || run_compute(&L, wl, &b)) { tr = tl = 0; break; }  // (a GPU error: no time)
+                            for (int o = 0; o < 2; o++) {
+                                BOOL ryu = (o == 0) == (rounds == 3 || round % 2 == 0);
+                                if ([g_stage isEqual:@"ps"]) ryu ? run_fragment(&R, &x, wr, &a) : run_fragment(&L, &y, wl, &b);
+                                else if ([g_stage isEqual:@"vs"]) ryu ? run_vertex(&R, &x, wr, types, &a) : run_vertex(&L, &y, wl, types, &b);
+                                else if (ryu ? run_compute(&R, wr, &a) : run_compute(&L, wl, &b)) { a = b = -1; break; }  // (a GPU error: no time)
+                            }
+                            if (a < 0) { tr = tl = 0; timed = NO; break; }
+                            ta[round] = a; tb[round] = b;
+                            if (rounds > 3) continue;
                             if (round == 1 || (round > 1 && a < tr)) tr = a;
                             if (round == 1 || (round > 1 && b < tl)) tl = b;
+                        }
+                        if (getenv("MAXMETAL_DIFF_TIME_LOG") && timed) {
+                            for (int r = 0; r < rounds; r++) fprintf(stderr, " %.4f/%.4f", ta[r], tb[r]);
+                            fprintf(stderr, "\n");
+                        }
+                        if (rounds > 3 && timed) {
+                            int n = rounds - 1;
+                            qsort(ta + 1, n, sizeof(double), cmp_double); qsort(tb + 1, n, sizeof(double), cmp_double);
+                            tr = ta[1 + n / 2]; tl = tb[1 + n / 2];
                         }
                     }
                     if (er || el) {

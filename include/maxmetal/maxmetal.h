@@ -52,8 +52,11 @@ typedef struct {
     bool tex_depth[128];        // a depth-format texture is bound there
     bool early_fragment_tests;  // fragment: NVN control byte +0x718
     bool depth_minus_w;         // nvnDeviceSetDepthMode(NEAR_IS_MINUS_W): clip z to Metal's 0..w
+    bool hw_layer_clamp;        // the GPU clamps a sample / gather / compare's array layer to the last layer itself:
+                                // no min(layer, get_array_size() - 1) (Metal leaves it unspecified; set it only for GPU
+                                // families checked, docs/adr/0003: Apple M4, A15). Texel reads keep their own handling
     uint32_t local[3];          // compute thread group size
-    const uint8_t *c1;          // constant buffer 1 (the program's constants: BRX jump tables), NULL: unknown
+    const uint8_t *c1;          // constant buffer 1 (the program's constants: BRX jump tables, inlined reads), NULL: unknown
     uint32_t c1_size;
 } NvnKey;
 

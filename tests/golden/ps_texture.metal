@@ -3,6 +3,7 @@
 
 using namespace metal;
 
+static inline float maxmetal_rcp(float x) { float r = fast::divide(1.0f, x), e = fma(fma(-x, r, 1.0f), r, r); return isfinite(e) ? e : r; }
 template<typename T> static inline T maxmetal_nz(T v) { return select(v, T(0.0f), isnan(v)); }
 struct maxmetal_cb
 {
@@ -43,7 +44,7 @@ fragment main0_out main0(main0_in in [[stage_in]], constant spvDescriptorSetBuff
     uint r7 = 0;
     do {
     r4 = as_type<uint>(gl_FragCoord[3]);
-    r4 = as_type<uint>((1.0f / as_type<float>(r4)));
+    r4 = as_type<uint>(maxmetal_rcp(as_type<float>(r4)));
     r5 = as_type<uint>(in.v0[0]);
     r6 = as_type<uint>(in.v0[1]);
     r7 = as_type<uint>(in.v0[2]);

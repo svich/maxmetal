@@ -14,7 +14,8 @@
 // stdin, one reply line {"ok": true} or {"ok": false, "error": "..."} on stdout, and <out>/<variant>_b.metal +
 // <variant>_b.json.
 // Request: {"variant", "stage": "vs|ps|cs", "code": path, "c1": hex, "tex": {slot: type}, "img": {...}, "attr": {...},
-//           "fout": {...}, "local": [x, y, z], "depth_minus_w": bool, "early_fragment_tests": bool}
+//           "fout": {...}, "local": [x, y, z], "depth_minus_w": bool, "early_fragment_tests": bool,
+//           "hw_layer_clamp": bool}
 // That service's arguments (maxmetal --service --spirv-cross <path> --out <dir> --chain <name>, or --one <file>) work too:
 // a renderer can start maxmetal in its place.
 #include <ctype.h>
@@ -198,6 +199,7 @@ static int handle(const J *rq, char *err, size_t errlen) {
     }
     nk.early_fragment_tests = jtruthy(jget(rq, "early_fragment_tests"));
     nk.depth_minus_w = jtruthy(jget(rq, "depth_minus_w"));
+    nk.hw_layer_clamp = jtruthy(jget(rq, "hw_layer_clamp"));
     for (int i = 0; local && local->t == J_ARR && i < local->n && i < 3; i++) nk.local[i] = (uint32_t)local->items[i].num;
     // c1 (hex): the program's constants, for BRX jump tables
     const J *c1h = jget(rq, "c1");

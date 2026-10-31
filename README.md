@@ -22,8 +22,10 @@ maxmetal does it in one step: Maxwell in, MSL out, in plain C with no dependenci
   for example, goes straight to the one storage buffer data flow found for it, unchecked as in Ryujinx.
 - **Same results.** It aims for the emulator route's results, not just plausible ones: on a real game's shader set,
   31305 of 31307 variants give bit-identical GPU output to Ryujinx + SPIRV-Cross (the other two: a mip selection in
-  divergent control flow, a shader whose own stores race), at the same GPU time. Its NVN mode emits the binding
-  layout SPIRV-Cross would, so it can take that pipeline's place without changing the renderer.
+  divergent control flow, a shader whose own stores race). The heaviest shaders of the game's frame take 9–27% less
+  GPU time than the Ryujinx path's ([ADR 0003](docs/adr/0003-speedups-over-ryujinx-are-bit-exact-rewrites.md)). Its
+  NVN mode emits the binding layout SPIRV-Cross would, so it can take that pipeline's place without changing the
+  renderer.
 
 Two binding contracts:
 
@@ -33,17 +35,16 @@ Two binding contracts:
 
 ## Origin
 
-maxmetal started as the Maxwell -> MSL translator of [LAS Recomp](https://github.com/peiikai/LASRecomp), Peiikai's
-static recompilation of *The Legend of Zelda: Link's Awakening* (`runtime/nvn/maxwell/` at commit `993774b`, MIT).
-That translator covered what one game needed. maxmetal extends it to the full shader set of a much larger game:
-the instructions it lacked (texture gathers and queries, bindless images, FP64, video ops, atomics and more),
-structured control flow in place of a `switch (pc)` state machine, the NVN binding layout, and global memory resolved
-to storage buffers by data flow.
+maxmetal is built on the Maxwell -> MSL translator of [LAS Recomp](https://github.com/peiikai/LASRecomp), Peiikai's
+static recompilation of *The Legend of Zelda: Link's Awakening* (`runtime/nvn/maxwell/` at commit `993774b`, MIT),
+which covers what that one game needs. maxmetal extends it to the full shader set of a much larger game: texture
+gathers and queries, bindless images, FP64, video ops, atomics and more, structured control flow in place of a
+`switch (pc)` state machine, the NVN binding layout, and global memory resolved to storage buffers by data flow.
 
-Ryujinx's shader pipeline (its instruction decoders, IR translation and passes such as GlobalToStorage) was the
-reference throughout: where hardware behaviour is unclear, maxmetal does what Ryujinx does, and `maxmetal-diff`
-checks the two against each other on the GPU. LAS Recomp's translator had already taken its instruction bit layouts
-from Ryujinx's decoders and its GPU documentation from [envytools](https://github.com/envytools/envytools).
+Ryujinx's shader pipeline (its instruction decoders, IR translation and passes such as GlobalToStorage) is the
+reference: where hardware behaviour is unclear, maxmetal does what Ryujinx does, and `maxmetal-diff` checks the two
+against each other on the GPU. The instruction bit layouts come from Ryujinx's decoders, by way of LAS Recomp, and the
+GPU documentation from [envytools](https://github.com/envytools/envytools).
 
 ## Build
 
@@ -112,6 +113,13 @@ The service reads one JSON request per line (`{"variant", "stage", "code": path,
 `{"ok": false, "error": "..."}`. It also accepts `maxmetal --service --spirv-cross <ignored> --out <dir> --chain <name>`,
 the arguments of a Ryujinx + SPIRV-Cross translation service, so it can be started in that one's place.
 
+`"hw_layer_clamp": true` (`NvnKey.hw_layer_clamp`) drops the `min(layer, get_array_size() - 1)` on the array layer of
+`sample`, `gather` and `sample_compare`, which saves 1–6% of the GPU code of a shader that samples arrays. The GPU then
+has to clamp an out-of-range layer to the last one itself, as Maxwell does. Metal's specification doesn't say what
+happens. Checked GPUs: Apple M4 and A15. Set it only for GPU families checked. Texel reads (`read`) are unaffected.
+On an unchecked GPU, an out-of-range layer could sample something else. In-range layers give the same result either
+way. [ADR 0003](docs/adr/0003-speedups-over-ryujinx-are-bit-exact-rewrites.md) has the probe that checks a GPU.
+
 ## Tests
 
 ```sh
@@ -147,6 +155,24 @@ display for the whole Mac. Other knobs: `MAXMETAL_DIFF_DUMP=<dir>`, `MAXMETAL_DI
 `MAXMETAL_DIFF_COMPILE_ONLY=1`, `MAXMETAL_DIFF_SEED=<text>` (other random inputs), `MAXMETAL_DIFF_INTS=N` (integers
 below N for every variant), `CS_TIME_GROUPS`, `CS_TIME_SCALE`, and for `--time` `MAXMETAL_DIFF_TIME_SIZE` (the
 fragment target's side, default 32) and `MAXMETAL_DIFF_TIME_INSTANCES` (instances of the 64 vertices, default 1).
+`MAXMETAL_DIFF_ARCHIVE=<dir>` also saves each pipeline's GPU binary there (`<variant>.<side>.bin`, a binary archive).
+The size of its code screens a change cheaply, but GPU time doesn't always follow it
+([ADR 0003](docs/adr/0003-speedups-over-ryujinx-are-bit-exact-rewrites.md)). With `MAXMETAL_DIFF_COMPILE_ONLY=1` as well, the
+pipelines are built and saved but never run (`fail <variant> build: ...` if one doesn't build): code sizes for any number
+of variants with no risk of a GPU hang.
+
+With the display active, a shader's GPU time can vary 3× from one process to the next, so comparisons need these
+`--time` options:
+- `MAXMETAL_DIFF_TIME_PAIRED=N` (fragment and vertex shaders):
+  - each side's render passes take turns: N of each, about 4 ms apiece, after about 100 ms of warming up;
+  - each side reports its lower quartile;
+  - repeated runs on one shader agree within about 1%, or 4–9% for memory-bound shaders.
+- `MAXMETAL_DIFF_TIME_NODUMP=1` (vertex shaders): time the function as it is, without the stores that dump its outputs,
+  and read the outputs with a fragment function that sums them. In `830d912d` the dump's 34 stores per vertex were a
+  quarter of the time at 256 instances. With 1024 instances, paired, A/A runs agree within about 1% (one shader in ten: 3%).
+- `MAXMETAL_DIFF_TIME_ROUNDS=N`: the other stages' medians over N rounds, the sides alternating which goes first.
+- `MAXMETAL_DIFF_TIME_ONEPASS=1`: all timed draws in one render pass.
+- `MAXMETAL_DIFF_TIME_LOG=1`: every round's times, on stderr.
 
 ## Environment
 

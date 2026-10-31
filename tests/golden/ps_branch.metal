@@ -3,6 +3,7 @@
 
 using namespace metal;
 
+static inline float maxmetal_rcp(float x) { float r = fast::divide(1.0f, x), e = fma(fma(-x, r, 1.0f), r, r); return isfinite(e) ? e : r; }
 struct maxmetal_cb
 {
     uint4 _m0[4096];
@@ -36,7 +37,7 @@ fragment main0_out main0(main0_in in [[stage_in]], float4 gl_FragCoord [[positio
   do {
   do {
     r4 = as_type<uint>(gl_FragCoord[3]);
-    r4 = as_type<uint>((1.0f / as_type<float>(r4)));
+    r4 = as_type<uint>(maxmetal_rcp(as_type<float>(r4)));
     r5 = as_type<uint>(in.v0[0]);
     { bool cmp = (as_type<float>(r5) > as_type<float>(0x3f000000u)); bool pp = true;
       p0 = cmp && pp;

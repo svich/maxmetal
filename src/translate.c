@@ -381,9 +381,15 @@ static void fcmp_expr(char *out, int op, const char *a, const char *b) {
     case 15: strcpy(out, "true"); break;
     case 7: sprintf(out, "(!isnan(%s) && !isnan(%s))", a, b); break;
     case 8: sprintf(out, "(isnan(%s) || isnan(%s))", a, b); break;
-    default:
-        if (op < 7) sprintf(out, "(%s %s %s)", a, cmp_op(op), b);
-        else sprintf(out, "((%s %s %s) || isnan(%s) || isnan(%s))", a, cmp_op(op), b, a, b);
+    // unordered: the ordered complement's negation (`!=` is unordered already), one compare where `|| isnan(a) ||
+    // isnan(b)` is three on the GPU
+    case 9: sprintf(out, "(!(%s >= %s))", a, b); break;
+    case 10: sprintf(out, "(!((%s < %s) || (%s > %s)))", a, b, a, b); break;
+    case 11: sprintf(out, "(!(%s > %s))", a, b); break;
+    case 12: sprintf(out, "(!(%s <= %s))", a, b); break;
+    case 13: sprintf(out, "(%s != %s)", a, b); break;
+    case 14: sprintf(out, "(!(%s < %s))", a, b); break;
+    default: sprintf(out, "(%s %s %s)", a, cmp_op(op), b);
     }
 }
 
@@ -788,9 +794,13 @@ static const char *RSC2(Ctx *c, int slot, const char *fmt, ...) {
     return o;
 }
 
+// (NVN) the key says the GPU clamps a sampling instruction's array layer as Maxwell does (NvnKey.hw_layer_clamp)
+static bool hw_layer_clamp(const Ctx *c) { return c->nvn && c->nvn->hw_layer_clamp && !c->glsl; }
+
 // TEXS / TLDS: texture_info selects target and coordinate layout
 static const char *alayer(Ctx *c, const char *r, int slot, char *buf) {
     if (c->glsl) sprintf(buf, "min(%s, uint(tsize%d(0).z) - 1u)", r, slot);
+    else if (hw_layer_clamp(c)) sprintf(buf, "%s", r);
     else sprintf(buf, "min(%s, t%d.get_array_size() - 1u)", r, slot);
     return buf;
 }
@@ -1070,7 +1080,11 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
     char coords[256] = "", layer[64] = "", tmp[64];
     int ar = a;
     // the hardware clamps the array index to the layer count
-    if (array) { sprintf(layer, "min(uint(r%d), t%d.get_array_size() - 1u)", a, slot); c->reg_used[a] = 1; ar = a + 1; }
+    if (array) {
+        if (hw_layer_clamp(c)) sprintf(layer, "uint(r%d)", a);
+        else sprintf(layer, "min(uint(r%d), t%d.get_array_size() - 1u)", a, slot);
+        c->reg_used[a] = 1; ar = a + 1;
+    }
     for (int i = 0; i < ncoord; i++) {
         sprintf(tmp, "%sas_type<float>(r%d)", i ? ", " : "", ar + i);
         c->reg_used[ar + i] = 1;
@@ -1124,8 +1138,8 @@ static void emit_tex(Ctx *c, uint64_t w, bool bindless) {
 // The code (structured, or without branches) tracks the slots by data flow too (nvn_gflow): an access whose address's
 // high word can only come from one slot's c0 entry goes there, its offset the low words' difference (MAXMETAL_GAT), as
 // Ryujinx's single-target access (constant offsets fold to constant indices), unchecked as that (gok true): a test of
-// the slot's size made small compute dispatches 1.2x the Ryujinx path's GPU time (2026-10-30). From a few slots it tests
-// just those (MAXMETAL_GIN), as Ryujinx's multi-target access; the rest search (MAXMETAL_GFIND), as yuzu. Until the flow is
+// the slot's size made small compute dispatches 1.2x the Ryujinx path's GPU time. From a few slots it tests
+// just those (MAXMETAL_GIN), as Ryujinx's multi-target access; the rest search every slot (MAXMETAL_GFIND). Until the flow is
 // known the access is MAXMETAL_GACC(ga, <its number>).
 
 // (nvn_gflow) in a block: a register write (kind 0: the register's origin is mask, or src's when src >= 0; cond: it
@@ -1286,7 +1300,8 @@ static void emit_tld4(Ctx *c, uint64_t w) {
     if (toff == 2 && cube) { fail(c, "tld4 ptp cube"); return; }
     int slot = tex_slot(c, (uint32_t)bits(w, 36, 13), type, dc, array);
     char layer[96] = "", off[160] = "", dref[64] = "";
-    if (array) sprintf(layer, "min(uint(%s), t%d.get_array_size() - 1u)", RZ0(a++), slot);
+    if (array && hw_layer_clamp(c)) sprintf(layer, "uint(%s)", RZ0(a++));
+    else if (array) sprintf(layer, "min(uint(%s), t%d.get_array_size() - 1u)", RZ0(a++), slot);
     char x[48], y[48], z[48];
     sprintf(x, "as_type<float>(%s)", RZ0(a)); sprintf(y, "as_type<float>(%s)", RZ0(a + 1));
     sprintf(z, "as_type<float>(%s)", RZ0(a + 2));
@@ -1352,7 +1367,8 @@ static void emit_txd(Ctx *c, uint64_t w) {
     char co[3][48], g[2][160], layer[96] = "", off[160] = "", call[2048];
     for (int i = 0; i < n; i++) sprintf(co[i], "as_type<float>(%s)", RZ0(a++));
     const char *pp = RZ0(a);
-    if (array) sprintf(layer, ", min(%s & 0xFFFFu, t%d.get_array_size() - 1u)", pp, slot);
+    if (array && hw_layer_clamp(c)) sprintf(layer, ", %s & 0xFFFFu", pp);
+    else if (array) sprintf(layer, ", min(%s & 0xFFFFu, t%d.get_array_size() - 1u)", pp, slot);
     for (int k = 0; k < 2; k++) {
         char *o = g[k];
         o += sprintf(o, "float%d(", n);
@@ -1708,7 +1724,7 @@ static void emit_insn(Ctx *c, uint64_t w, uint32_t pc) {
         case 1: sprintf(t, "sin(%s)", x); break;
         case 2: sprintf(t, "exp2(%s)", x); break;
         case 3: sprintf(t, "log2(%s)", x); break;
-        case 4: sprintf(t, "(1.0f / %s)", x); break;
+        case 4: sprintf(t, nvn_on(c) ? "maxmetal_rcp(%s)" : "(1.0f / %s)", x); break;
         case 5: sprintf(t, "rsqrt(%s)", x); break;
         case 8: sprintf(t, "sqrt(%s)", x); break;
         default: fail(c, "mufu %d", fn); return;
@@ -4119,6 +4135,9 @@ static void nvn_helpers(Str *s, size_t at) {
         {"hx(", "static inline float2 hx(uint v, uint swz) { if (swz == 1u) return float2(as_type<float>(v)); float2 h = float2(as_type<half2>(v)); return swz == 2u ? h.xx : swz == 3u ? h.yy : h; }\n"},
         {"hpack(", "static inline uint hpack(float2 r, uint merge, uint old) { if (merge == 1u) return as_type<uint>(r.x); half2 o = as_type<half2>(old), n = half2(r); if (merge == 2u) o.x = n.x; else if (merge == 3u) o.y = n.y; else o = n; return as_type<uint>(o); }\n"},
         {"prmt(", "static inline uint prmt(uint a, uint b, uint sel) { uint r = 0; for (uint i = 0; i < 4; i++) { uint s = (sel >> (i * 4)) & 7u; uint byte = s < 4 ? (a >> (s * 8)) & 0xFFu : (b >> ((s - 4) * 8)) & 0xFFu; r |= byte << (i * 8); } return r; }\n"},
+        // 1 / x, bit for bit (all 2^32 x) in a third of the GPU code: Metal's 1.0f / x in safe math is a
+        // general correctly rounded division; the GPU's reciprocal is off by an ulp at most, which one fma step corrects
+        {"maxmetal_rcp(", "static inline float maxmetal_rcp(float x) { float r = fast::divide(1.0f, x), e = fma(fma(-x, r, 1.0f), r, r); return isfinite(e) ? e : r; }\n"},
         {"maxmetal_nz(", "template<typename T> static inline T maxmetal_nz(T v) { return select(v, T(0.0f), isnan(v)); }\n"},
         {"maxmetal_d16ref(", "static inline float maxmetal_d16ref(float r) { return floor(fast::clamp(r, 0.0f, 1.0f) * 65535.0f + 0.5f) * (1.0f / 65535.0f); }\n"},
         // (SPIRV-Cross's) a compare of a colour texture: its handle as the depth texture
@@ -4148,6 +4167,377 @@ static void nvn_helpers(Str *s, size_t at) {
     *s = o;
 }
 
+// ---- (NVN) bank 1 inlined: c1 holds the program's own constants (the request's c1, zeros after them), so a read at a
+// constant index can be that word, which Metal's compiler folds, instead of a load. Two limits keep the result the
+// Ryujinx path's, bit for bit (docs/adr/0003):
+// - not +-1.0 / +-0.0: the compiler folds x * 1.0, x / -1.0, x - 0.0 ... to x, where the GPU flushes a denormal x to 0
+//   and gives its default NaN for a NaN x;
+// - not at all when a value computed only from constants, one of them such a word, may reach exp2 / log2 / sin / cos /
+//   sqrt / rsqrt: the compiler computes those itself, not as the GPU does (the A15's GPU compiler sin and cos too).
+// The check below follows the emitted body: which variables may hold such a value, merging both ways of an if and a
+// loop's iterations (a may-analysis: a false alarm only leaves one shader its loads).
+#define C1V_N 2048
+typedef struct { uint8_t k[C1V_N], t[C1V_N]; } C1Vals;  // k: may be a constant; t: ... computed from an inlined c1 word
+typedef struct C1Walk C1Walk;
+struct C1Walk {
+    const char *s; size_t i, n;
+    const NvnKey *nk;
+    char pat[64];             // "(*spvDescriptorSet0.<pfx>_c1)._m0["
+    char (*names)[32];
+    bool hit;
+    C1Vals *loop_exits;       // the innermost loop's break / continue states
+    C1Vals *sw_entry;         // the innermost switch's entry (a case label joins it)
+};
+
+static bool c1_word_inlinable(const NvnKey *nk, uint32_t word) {
+    uint32_t v = 0;
+    if ((uint64_t)word * 4 + 4 <= nk->c1_size) memcpy(&v, nk->c1 + word * 4, 4);
+    return (v & 0x7FFFFFFFu) != 0x3F800000u && (v & 0x7FFFFFFFu) != 0u;
+}
+
+// "<pat><digits>u][<digit>]" at p: the word index, and its length (0: not a constant-index c1 read)
+static size_t c1_read_at(const C1Walk *w, const char *p, uint32_t *word) {
+    size_t lp = strlen(w->pat);
+    if (strncmp(p, w->pat, lp)) return 0;
+    unsigned row, col;
+    int used = 0;
+    if (sscanf(p + lp, "%uu][%u]%n", &row, &col, &used) != 2 || !used || col > 3) return 0;
+    *word = row * 4 + col;
+    return lp + (size_t)used;
+}
+
+static int c1_var(C1Walk *w, const char *p, size_t len) {
+    if (len >= 32) len = 31;
+    uint32_t h = 2166136261u;
+    for (size_t k = 0; k < len; k++) h = (h ^ (uint8_t)p[k]) * 16777619u;
+    for (uint32_t probe = 0; probe < C1V_N; probe++) {
+        char *e = w->names[(h + probe) % C1V_N];
+        if (!e[0]) { memcpy(e, p, len); e[len] = 0; return (int)((h + probe) % C1V_N); }
+        if (!strncmp(e, p, len) && !e[len]) return (int)((h + probe) % C1V_N);
+    }
+    w->hit = true;  // (table full: keep the loads)
+    return -1;
+}
+
+static bool c1_pure(const char *p, size_t len) {
+    static const char *const pure[] = {
+        "as_type", "float", "float2", "float3", "float4", "half", "half2", "half3", "half4", "uint", "uint2", "uint3",
+        "uint4", "int", "int2", "int3", "int4", "ushort", "ushort2", "short", "short2", "uchar", "char", "bool", "bool2",
+        "bool3", "bool4", "ulong", "long", "true", "false", "fma", "abs", "saturate", "min", "max", "fmin", "fmax", "clamp",
+        "select", "rint", "floor", "ceil", "trunc", "fract", "round", "exp2", "log2", "sin", "cos", "sqrt", "rsqrt",
+        "maxmetal_rcp", "isnan", "isinf", "isfinite", "isunordered", "extract_bits", "insert_bits", "popcount", "clz",
+        "ctz", "reverse_bits", "mulhi", "bfe_u", "bfe_s", "bfi", "hx", "hpack", "prmt", "fswzadd", "sign", "copysign",
+        "step", "mix", "fast", "precise", "metal", "maxmetal_nz", "maxmetal_d2f", "maxmetal_f2d", "maxmetal_d16ref",
+        "rscale", "rsc", "uvs", NULL};
+    for (int k = 0; pure[k]; k++) if (strlen(pure[k]) == len && !strncmp(pure[k], p, len)) return true;
+    return false;
+}
+
+// e[0..len): may it be a constant (*k), computed from an inlined c1 word (*t)?
+static void c1_value(C1Walk *w, const C1Vals *st, const char *e, size_t len, bool *k, bool *t) {
+    *k = true; *t = false;
+    char prev = 0;
+    for (size_t i = 0; i < len;) {
+        uint32_t word;
+        size_t m = e[i] == '(' ? c1_read_at(w, e + i, &word) : 0;
+        if (m && i + m <= len) {
+            if (c1_word_inlinable(w->nk, word)) *t = true; else *k = false;
+            i += m; prev = ']';
+            continue;
+        }
+        char ch = e[i];
+        if ((ch >= '0' && ch <= '9') || (ch == '.' && i + 1 < len && e[i + 1] >= '0' && e[i + 1] <= '9')) {
+            while (i < len && (id_char(e[i]) || e[i] == '.')) i++;  // a literal (1.5e-05f: "-05f" another one)
+            prev = '0';
+            continue;
+        }
+        if (id_start(ch)) {
+            size_t b = i;
+            while (i < len && id_char(e[i])) i++;
+            if (prev == '.' || (i + 1 < len && e[i] == ':' && e[i + 1] == ':') || c1_pure(e + b, i - b)) { prev = 'a'; continue; }
+            int v = c1_var(w, e + b, i - b);
+            if (v >= 0 && st->k[v]) *t = *t || st->t[v];
+            else *k = false;
+            prev = 'a';
+            continue;
+        }
+        if (ch != ' ' && ch != '\n' && ch != '\t') prev = ch;
+        i++;
+    }
+    if (!*k) *t = false;
+}
+
+// the transcendentals in e[0..len) whose argument may be such a value
+static void c1_check_calls(C1Walk *w, const C1Vals *st, const char *e, size_t len) {
+    static const char *const fn[] = {"exp2", "log2", "sin", "cos", "sqrt", "rsqrt", NULL};
+    for (size_t i = 0; i < len && !w->hit; i++) {
+        if (!id_start(e[i]) || (i && (id_char(e[i - 1]) || e[i - 1] == '.'))) continue;
+        size_t b = i;
+        while (i < len && id_char(e[i])) i++;
+        size_t j = i;
+        while (j < len && e[j] == ' ') j++;
+        if (j >= len || e[j] != '(') { i--; continue; }
+        bool is = false;
+        for (int f = 0; fn[f]; f++) if (strlen(fn[f]) == i - b && !strncmp(fn[f], e + b, i - b)) is = true;
+        if (!is) { i--; continue; }
+        size_t a = j + 1, q = a;
+        for (int d = 1; q < len && d; q++) d += e[q] == '(' ? 1 : e[q] == ')' ? -1 : 0;
+        bool k, t;
+        c1_value(w, st, e + a, q - 1 - a, &k, &t);
+        if (t) w->hit = true;
+        i = a - 1;
+    }
+}
+
+static void c1_union(C1Vals *a, const C1Vals *b) { for (int i = 0; i < C1V_N; i++) { a->k[i] |= b->k[i]; a->t[i] |= b->t[i]; } }
+
+static bool c1_is_type(const char *p, size_t len) {
+    static const char *const ty[] = {"bool", "uint", "int", "float", "half", "ushort", "short", "uchar", "char", "ulong",
+                                     "long", NULL};
+    for (int k = 0; ty[k]; k++) {
+        size_t l = strlen(ty[k]);
+        if (len >= l && len <= l + 1 && !strncmp(p, ty[k], l) && (len == l || (p[l] >= '2' && p[l] <= '4'))) return true;
+    }
+    return false;
+}
+
+// one statement e[0..len) (no ';'): `[type] name = expr` (declarators split at top-level commas), `lvalue op= expr`
+static void c1_statement(C1Walk *w, C1Vals *st, const char *e, size_t len) {
+    c1_check_calls(w, st, e, len);
+    while (len && (*e == ' ' || *e == '\n')) { e++; len--; }
+    if (len > 6 && !strncmp(e, "const ", 6)) { e += 6; len -= 6; }
+    size_t i = 0;
+    while (i < len && id_char(e[i])) i++;
+    bool decl = i && c1_is_type(e, i) && i < len && e[i] == ' ';
+    if (decl) { e += i + 1; len -= i + 1; }
+    while (len) {  // each declarator / the assignment
+        size_t end = 0;
+        for (int d = 0; end < len; end++) {
+            char ch = e[end];
+            d += (ch == '(' || ch == '[' || ch == '{') ? 1 : (ch == ')' || ch == ']' || ch == '}') ? -1 : 0;
+            if (decl && d == 0 && ch == ',') break;
+        }
+        // the top-level '=' (not ==, <=, >=, !=) and an operator before it
+        size_t eq = 0; int d = 0;
+        for (size_t q = 0; q < end; q++) {
+            char ch = e[q];
+            d += (ch == '(' || ch == '[' || ch == '{') ? 1 : (ch == ')' || ch == ']' || ch == '}') ? -1 : 0;
+            if (d == 0 && ch == '=' && (q + 1 >= end || e[q + 1] != '=') && (!q || !strchr("=<>!", e[q - 1]) ||
+                (q >= 2 && (e[q - 1] == '<' || e[q - 1] == '>') && e[q - 2] == e[q - 1]))) { eq = q; break; }
+        }
+        if (eq) {
+            bool compound = strchr("|&^+-*/%<>", e[eq - 1]) != NULL;
+            size_t lend = eq - (compound ? (e[eq - 1] == '<' || e[eq - 1] == '>') ? 2 : 1 : 0);
+            const char *l = e;
+            while (l < e + lend && (*l == ' ' || *l == '(' || *l == '*')) l++;
+            size_t ln = 0;
+            while (l + ln < e + lend && id_char(l[ln])) ln++;
+            const char *r = l + ln;
+            while (r < e + lend && *r == ' ') r++;
+            bool simple = r == e + lend;  // a plain variable (else an element, a member, a dereference: a store)
+            bool k, t;
+            c1_value(w, st, e + eq + 1, end - eq - 1, &k, &t);
+            int v = ln ? c1_var(w, l, ln) : -1;
+            if (v >= 0) {
+                if (!simple) { if (t) { st->k[v] = 1; st->t[v] = 1; } }  // (it may now hold one: sticky)
+                else if (compound) { bool kk = k && st->k[v]; st->t[v] = kk && (t || st->t[v]); st->k[v] = kk; }
+                else { st->k[v] = k; st->t[v] = t; }
+            }
+        } else if (decl) {  // declared, no value: not a constant
+            size_t ln = 0;
+            while (ln < end && id_char(e[ln])) ln++;
+            int v = ln ? c1_var(w, e, ln) : -1;
+            if (v >= 0) st->k[v] = st->t[v] = 0;
+        }
+        if (end >= len) break;
+        e += end + 1; len -= end + 1;
+        while (len && *e == ' ') { e++; len--; }
+    }
+}
+
+static void c1_ws(C1Walk *w) {
+    for (;;) {
+        while (w->i < w->n && strchr(" \t\r\n", w->s[w->i])) w->i++;
+        if (w->i + 1 < w->n && w->s[w->i] == '/' && w->s[w->i + 1] == '/') { while (w->i < w->n && w->s[w->i] != '\n') w->i++; continue; }
+        if (w->i + 1 < w->n && w->s[w->i] == '/' && w->s[w->i + 1] == '*') {
+            const char *e = strstr(w->s + w->i + 2, "*/");
+            w->i = e ? (size_t)(e - w->s) + 2 : w->n;
+            continue;
+        }
+        return;
+    }
+}
+
+static bool c1_kw(C1Walk *w, const char *kw) {
+    size_t l = strlen(kw);
+    if (strncmp(w->s + w->i, kw, l) || id_char(w->s[w->i + l])) return false;
+    w->i += l;
+    return true;
+}
+
+// "( ... )" at the position: its contents
+static void c1_paren(C1Walk *w, size_t *a, size_t *b) {
+    c1_ws(w);
+    *a = *b = w->i;
+    if (w->i >= w->n || w->s[w->i] != '(') return;
+    size_t q = w->i + 1;
+    for (int d = 1; q < w->n && d; q++) d += w->s[q] == '(' ? 1 : w->s[q] == ')' ? -1 : 0;
+    *a = w->i + 1; *b = q - 1; w->i = q;
+}
+
+static void c1_item(C1Walk *w, C1Vals *st);
+static void c1_block(C1Walk *w, C1Vals *st);
+
+static void c1_loop(C1Walk *w, C1Vals *st, bool body_first, bool is_switch) {
+    // the body runs from the entry state merged with every state its back edge brings, to a fixpoint (the sets only grow)
+    size_t start = w->i, after = start;
+    C1Vals *entry = malloc(sizeof *entry), *s = malloc(sizeof *s), *exits = calloc(1, sizeof *exits);
+    *entry = *st;
+    C1Vals *saved_exits = w->loop_exits, *saved_sw = w->sw_entry;
+    bool cond_false = false;
+    for (int it = 0; it < 8; it++) {
+        w->i = start; *s = *entry;
+        w->loop_exits = exits;
+        if (is_switch) w->sw_entry = entry;
+        c1_item(w, s);
+        after = w->i;
+        cond_false = false;
+        if (body_first) {  // do { } while (cond);
+            c1_ws(w);
+            if (c1_kw(w, "while")) {
+                size_t a, b;
+                c1_paren(w, &a, &b);
+                c1_check_calls(w, s, w->s + a, b - a);
+                cond_false = b - a == 5 && !strncmp(w->s + a, "false", 5);
+                c1_ws(w);
+                if (w->i < w->n && w->s[w->i] == ';') w->i++;
+            }
+            after = w->i;
+        }
+        if (cond_false && !is_switch) break;
+        C1Vals next = *entry;
+        c1_union(&next, s);
+        c1_union(&next, exits);  // (continue: the back edge too)
+        if (!memcmp(&next, entry, sizeof next)) break;
+        *entry = next;
+    }
+    w->loop_exits = saved_exits; w->sw_entry = saved_sw;
+    *st = *s;
+    c1_union(st, exits);
+    if (!body_first || is_switch) c1_union(st, entry);  // (while / for: maybe no iteration)
+    w->i = after;
+    free(entry); free(s); free(exits);
+}
+
+// the statements up to the closing '}' (or the end)
+static void c1_block(C1Walk *w, C1Vals *st) {
+    while (!w->hit) {
+        c1_ws(w);
+        if (w->i >= w->n) return;
+        if (w->s[w->i] == '}') { w->i++; return; }
+        c1_item(w, st);
+    }
+}
+
+// one construct at the position: a { block }, an if (else), a loop, a case label or a statement
+static void c1_item(C1Walk *w, C1Vals *st) {
+    c1_ws(w);
+    if (w->i >= w->n) return;
+    if (w->s[w->i] == '{') { w->i++; c1_block(w, st); return; }
+    if (c1_kw(w, "if")) {
+        size_t a, b;
+        c1_paren(w, &a, &b);
+        c1_check_calls(w, st, w->s + a, b - a);
+        C1Vals *els = malloc(sizeof *els);
+        *els = *st;
+        c1_item(w, st);
+        c1_ws(w);
+        if (c1_kw(w, "else")) c1_item(w, els);
+        c1_union(st, els);
+        free(els);
+        return;
+    }
+    if (c1_kw(w, "do")) { c1_loop(w, st, true, false); return; }
+    bool sw = c1_kw(w, "switch");
+    if (sw || c1_kw(w, "while") || c1_kw(w, "for")) {
+        size_t a, b;
+        c1_paren(w, &a, &b);
+        c1_check_calls(w, st, w->s + a, b - a);
+        c1_loop(w, st, false, sw);
+        return;
+    }
+    if (c1_kw(w, "case") || c1_kw(w, "default")) {  // a jump target: the switch's entry joins here
+        while (w->i < w->n && w->s[w->i] != ':') w->i++;
+        w->i++;
+        if (w->sw_entry) c1_union(st, w->sw_entry);
+        else w->hit = true;  // (a case outside any switch: give up)
+        return;
+    }
+    size_t q = w->i;
+    for (int d = 0; q < w->n; q++) {
+        char ch = w->s[q];
+        d += (ch == '(' || ch == '[' || ch == '{') ? 1 : (ch == ')' || ch == ']' || ch == '}') ? -1 : 0;
+        if (d < 0 || (d == 0 && ch == ';')) break;
+    }
+    const char *e = w->s + w->i;
+    size_t len = q - w->i;
+    w->i = q < w->n && w->s[q] == ';' ? q + 1 : q;
+    while (len && strchr(" \t\n", e[len - 1])) len--;
+    if ((len == 5 && !strncmp(e, "break", 5)) || (len == 8 && !strncmp(e, "continue", 8))) {
+        if (w->loop_exits) c1_union(w->loop_exits, st);
+        return;
+    }
+    c1_statement(w, st, e, len);
+}
+
+// The body with bank 1's inlinable words in place of their loads, unless the check finds one reaching a transcendental
+static void nvn_inline_c1(Ctx *c) {
+    const NvnKey *nk = c->nvn;
+    if (!nk || !nk->c1 || !c->body.buf || !(c->info->cbuf_mask & 2u)) return;
+    C1Walk w = {.s = c->body.buf, .n = c->body.len, .nk = nk};
+    snprintf(w.pat, sizeof w.pat, "(*spvDescriptorSet0.%s_c1)._m0[", c->pfx);
+    if (!strstr(c->body.buf, w.pat)) return;
+    w.names = calloc(C1V_N, sizeof *w.names);
+    C1Vals *st = calloc(1, sizeof *st);
+    // the registers, predicates and condition codes start as 0 / false: constants
+    for (const char *p = c->body.buf; *p; p++) {
+        if (!id_start(*p) || (p > c->body.buf && (id_char(p[-1]) || p[-1] == '.'))) continue;
+        size_t l = 0;
+        while (id_char(p[l])) l++;
+        bool reg = (p[0] == 'r' || p[0] == 'p') && l > 1 && l <= 4;
+        for (size_t k = 1; reg && k < l; k++) reg = p[k] >= '0' && p[k] <= '9';
+        if (reg || (l == 2 && !strncmp(p, "cc", 2)) || (l == 3 && (!strncmp(p, "ccz", 3) || !strncmp(p, "ccs", 3)))) {
+            int v = c1_var(&w, p, l);
+            if (v >= 0) st->k[v] = 1;
+        }
+        p += l - 1;
+    }
+    c1_block(&w, st);
+    free(st); free(w.names);
+    if (w.hit) return;
+    Str o = {0};
+    bool left = false;  // (a load of bank 1 is left: its binding stays)
+    const char *p = c->body.buf, *q;
+    while ((q = strstr(p, w.pat))) {
+        uint32_t word;
+        size_t m = c1_read_at(&w, q, &word);
+        if (m && c1_word_inlinable(nk, word)) {
+            uint32_t v = 0;
+            if ((uint64_t)word * 4 + 4 <= nk->c1_size) memcpy(&v, nk->c1 + word * 4, 4);
+            sp(&o, "%.*s0x%08xu", (int)(q - p), p, v);
+            p = q + m;
+        } else {
+            left = true;
+            sp(&o, "%.*s", (int)(q - p + 1), p);
+            p = q + 1;
+        }
+    }
+    sp(&o, "%s", p);
+    free(c->body.buf);
+    c->body = o;
+    if (!left) c->info->cbuf_mask &= ~2u;
+}
+
 static ShaderInfo *nvn_finish(Ctx *c, bool any_branch) {
     ShaderInfo *info = c->info;
     const ShaderKey *key = c->key;
@@ -4175,6 +4565,7 @@ static ShaderInfo *nvn_finish(Ctx *c, bool any_branch) {
         if (!strstr(c->body.buf, vec)) c->drv_read[1][byte >> 4] = 0;
     }
     if (c->nimg && c->body.buf && !strstr(c->body.buf, "_c2)") && !c->drv_dyn[1]) info->cbuf_mask &= ~4u;
+    nvn_inline_c1(c);
     for (int k = 0; k < 16; k++) {
         if (c->sslot & (1u << k)) { c->drv_read[0][(sbase + 16 * k) >> 4] = 1; info->cbuf_mask |= 1u; }
         if (c->uslot & (1u << k)) { c->drv_read[0][(0x210 + 16 * k) >> 4] = 1; info->cbuf_mask |= 1u; }
